@@ -60,6 +60,8 @@
 
 (表中两个名词先解释一下。"白障条目"是 overlayfs 用来在上层目录里标记"下层的这个名字要当作不存在"的特殊条目,详见下面第五节。"挂载命名空间"是内核为一组进程各自保存一份挂载表的机制,不同命名空间里同一条路径可以挂着不同的东西;"绑定挂载"是把一个已有的目录再挂到另一条路径上,例如把 `/srv/repo-a` 绑定挂到 `/workspace`。)
 
+**2026-08-05 补充:这张表每一格写具体做法而不是打勾,是有意为之。** BranchFS 用过一张逐项打勾的对照表,其中两格被它自己引的参考文献推翻——一格是"联合文件系统没有把改动合并回父层的原生能力",而 device-mapper 的 `snapshot-merge` 目标做的正是这件事;另一格是"挂载需要 root 权限",而 `userxattr` 挂载选项使得在用户命名空间内以非 root 身份挂 overlayfs 可行。(这两条转引自检索环节,我们本轮未重抓原文,写进论文前请再核。)**逐项打勾是高风险体裁:一格出错,整张表都会被怀疑。** 所以本表每一格都写清实际做法与适用条件。
+
 从这张表能读出三条观察:
 
 - **overlayfs 自己的接口本来就把这七件事切成了两组。** `lowerdir` 回答的是第 1、2 件,`upperdir` 回答的是第 3 到 6 件。它并没有把两组混在一起实现,只是把两组绑在了同一次挂载里。本机制做的事情,是把第 1、2 件从挂载里拿出来,改成每次查找按任务现算。
@@ -84,7 +86,21 @@
 2. **要测的东西变明确了。** 对照组从"每视图一次 overlayfs 挂载"换成"每视图一个挂载命名空间加绑定挂载"。
 3. **但它没有解决任何数据缺口。** 按视图数量变化的成本曲线,一条都还没有测出来。
 
+**2026-08-05 补充:一个必须正面回答的竞争者。**
+
+DeltaBox 已经把我们想讲的这条缺口写进了它自己的论文当动机。原句我们亲手抓 arXiv 正文第 4.1 节核实过:`Standard Linux overlayfs fixes its layer stack at mount time; reconfiguring it requires an umount/mount cycle, impossible while the agent holds open files and untenable at the checkpoint rates MCTS demands.`(标准的 Linux overlayfs 在挂载时就把层栈固定了;要重新配置就得卸载再挂载一次,而在智能体还握着打开的文件时这做不到,在蒙特卡洛树搜索所要求的检查点频率下也撑不住。)
+
+**但它解决这条缺口的办法不是另造一个机制,而是直接改 overlayfs**:用 XFS 加 reflink 作底,再配一个改过的 overlayfs 内核模块,通过一个自定义的 ioctl(ioctl 是让用户态程序向内核下达特定控制命令的接口)在不卸载的情况下重排层栈。
+
+于是审稿人会问:既然给 overlayfs 加一个重排层栈的 ioctl 就能做到运行中换视图,为什么要在名字解析路径上另开一个扩展点?**我们唯一站得住的答复是粒度**——改层栈是按挂载生效的,同一个挂载点上的所有使用者一起换;我们的判定是按任务的,同一个挂载点上不同的任务可以同时看到不同的东西。**这个差别必须在论文里主动写出来并引用 DeltaBox,不能等审稿人提出来。** 完整调查见 `docs/review/近邻系统如何论证值得新加一个机制-2026-08-05.md`。
+
 **一条必须守住的纪律:不许写"挂载方案做不到按任务给不同视图"。** 我们在 2026-07-10 实测过:在 root 权限下,或者无特权但提前建好用户命名空间的情况下,同一个进程的两个线程可以各自进入不同的挂载命名空间。**挂载路线做得到。** 真正的差别是:每个线程要付一份完整挂载表的复制,所有挂载操作要在一把全局锁后面排队,而且该线程会永久失去与兄弟线程共享当前工作目录的能力。**这是成本与粒度上的差别,不是能力上的差别。** 这句话写错,审稿人查一下文档就能推翻整段论证。
+
+**2026-08-05 补充:再加两条同类禁令,都有近邻系统栽过的实例。**
+
+**其一,不许写"挂载不能撤销已经可见的路径"。** YoloFS 论文写过这句话的英文版本(`it can expose additional paths, but it cannot revoke access to visible paths`),它不成立:`mount_namespaces(7)` 手册页自己就给了反例,我们亲手抓原文核实过——执行 `mount --bind /dev/null /etc/shadow` 之后 `cat /etc/shadow` 没有任何输出,手册的解释句是 `The above steps, performed in a more privileged mount namespace, have created a bind mount that obscures the contents of the shadow password file, /etc/shadow.` 撑得住的是它背后的意思,但必须换成准确表述:挂载是一次性布置好的静态安排,不是每次访问重新走一遍的判定;而且已经打开的文件描述符撤不掉。
+
+**其二,不许写针对 overlayfs 的成本论证。** 两个挂载选项会当场推翻它,官方文档原句我们亲手核实过:`metacopy` 使得 `overlayfs will only copy up metadata (as opposed to whole file), when a metadata specific operation like chown/chmod is performed.`,而且 `The data will be copied up later when file is opened for WRITE operation.`;`redirect_dir` 使得改目录名时 `the directory will be copied up (but not the contents). Then the "trusted.overlay.redirect" extended attribute is set to the path of the original location from the root of the overlay.` YoloFS 那条"镜像基线树太贵"的论证正是因为没考虑这两个选项而不成立。
 
 ---
 
