@@ -43,6 +43,10 @@
 
 信息与调优上的公平:四个条件用同一批底层目录树、同一份视图内容清单、同一套虚拟机资源、同样的预热次数与测量次数;条件顺序按启动轮换。
 
+**2026-08-05 补充:建议增加第五个条件——按 DeltaBox 的做法给 overlayfs 加上运行中重排层栈的能力之后的对照。** DeltaBox 已发表的做法是用 XFS 加 reflink 作底,配一个改过的 overlayfs 内核模块,通过一个自定义的 ioctl(让用户态程序向内核下达特定控制命令的接口)在不卸载的情况下重排层栈;它的动机原句我们亲手抓 arXiv 正文第 4.1 节核实过:`Standard Linux overlayfs fixes its layer stack at mount time; reconfiguring it requires an umount/mount cycle, impossible while the agent holds open files and untenable at the checkpoint rates MCTS demands.`
+
+**如果这一条件暂时不实现,必须在 `## Interpretation` 一节里写明**:本实验不能回答"给 overlayfs 加一个重排层栈的 ioctl 是否就够了",而这正是审稿人会问的问题;我们的答复只能建立在按任务与按挂载的粒度差别上(改层栈按挂载生效,同一挂载点上所有使用者一起换;我们的判定按任务生效,同一挂载点上不同任务可以同时看到不同的东西),而不是能力有无。
+
 ## Frozen Mechanism Configuration
 
 正式跑之前必须冻结并写进结果元数据的东西:
@@ -54,6 +58,7 @@
 - 策略程序:BPF 源码提交号与编译产物哈希;每视图写入的规则条数。
 - **btrfs 子卷是否开启配额组必须写明并冻结**,因为官方文档承认开启配额组时快照规模化会有不可接受的延迟;两种设置下的数字不可混用。
 - 视图内容清单:目录树的文件数、目录数、总字节数,以及每份视图与基线树的差异条数。
+- **2026-08-05 补充:条件 2(每视图一次 overlayfs 挂载)必须显式开启 `metacopy` 与 `redirect_dir` 两个挂载选项,并把完整的挂载选项串记录进结果元数据。** 理由是不开这两个选项等于拿一个被人为削弱的 overlayfs 作对照,得出的数字没有说服力:YoloFS 论文里那条"把基线目录树镜像到上层太贵"的成本论证,正是因为没考虑这两个选项而不成立。内核官方文档原句(我们亲手核实过):`metacopy` 使得 `When the "metacopy" feature is enabled, overlayfs will only copy up metadata (as opposed to whole file), when a metadata specific operation like chown/chmod is performed.`,而且 `The data will be copied up later when file is opened for WRITE operation.`;`redirect_dir` 使得改目录名时 `the directory will be copied up (but not the contents). Then the "trusted.overlay.redirect" extended attribute is set to the path of the original location from the root of the overlay.` 两个选项的开关状态在整个矩阵内必须一致,不同设置下的数字不可混用。
 
 ## Workloads And Metrics
 
@@ -97,6 +102,7 @@
 - **不能得出本机制比 overlayfs 更好。** overlayfs 多给了写隔离,条件 2 与本机制不是同功能对照。
 - **不能得出速度更快。** 这个实验不测单次操作延迟,也不测应用端到端时间;既有的相对 FUSE 的数字(缓存命中查找 1.052–1.088、目录枚举 2.20–3.66 倍)回答的是另一个问题。
 - **不能推广到别的机器。** 结论限定在冻结配置里写明的那台虚拟机、那种底层文件系统与那份视图内容清单上。
+- **2026-08-05 补充:只要 `## Comparison` 里那个第五条件没有实现,就不能回答"给 overlayfs 加一个重排层栈的 ioctl 是否就够了"。** 这是审稿人会问的问题,DeltaBox 已经把这条路实现出来并发表了。这种情况下我们的答复只能建立在按任务与按挂载的粒度差别上,而不是能力有无:改层栈按挂载生效,同一挂载点上的所有使用者一起换;我们的判定按任务生效,同一挂载点上不同任务可以同时看到不同的东西。这句限制要一并写进论文。
 
 可以得出的结论只有一条:在这台机器、这个视图数量范围内,每份视图的供给成本随视图数量的增长关系,本机制与主对照相比是什么样。
 
