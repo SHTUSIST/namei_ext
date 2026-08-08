@@ -24,13 +24,23 @@ def percentile(sorted_values, fraction):
     return sorted_values[index]
 
 
+# The warm metrics have tens of thousands of samples per condition. Resampling
+# all of them ten thousand times is not affordable in plain Python and buys
+# nothing: the median's sampling distribution is already tight at this size.
+# Each bootstrap replicate therefore draws a fixed number of points, and that
+# number is recorded in the summary so the interval can be reproduced.
+BOOTSTRAP_DRAW = 4000
+
+
 def ratio_ci(numerator, denominator, rng, resamples=2000):
+    draw_numerator = min(len(numerator), BOOTSTRAP_DRAW)
+    draw_denominator = min(len(denominator), BOOTSTRAP_DRAW)
     estimates = []
     for _ in range(resamples):
         num = [numerator[rng.randrange(len(numerator))]
-               for _ in range(len(numerator))]
+               for _ in range(draw_numerator)]
         den = [denominator[rng.randrange(len(denominator))]
-               for _ in range(len(denominator))]
+               for _ in range(draw_denominator)]
         base = statistics.median(den)
         if base == 0:
             raise SystemExit("zero denominator in ratio bootstrap")
@@ -73,6 +83,9 @@ def main():
         raise SystemExit("no native condition; nothing to compare against")
 
     summary = {"schema": "namei_ext.overlay_read_path_tax.summary.v1",
+               "bootstrap_resamples": 2000,
+               "bootstrap_draw_per_replicate": BOOTSTRAP_DRAW,
+               "seed": args.seed,
                "conditions": [], "identity": identity}
 
     for condition in sorted(pooled, key=lambda name: depth_of[name]):
