@@ -1,0 +1,500 @@
+{
+  "mountns_bind_minus_control": [
+    {
+      "slab_kb_per_view": 0.0,
+      "supply_p50_delta_ns": 130315,
+      "views": 1
+    },
+    {
+      "slab_kb_per_view": 0.8,
+      "supply_p50_delta_ns": 66820,
+      "views": 10
+    },
+    {
+      "slab_kb_per_view": 12.68,
+      "supply_p50_delta_ns": 22297,
+      "views": 100
+    },
+    {
+      "slab_kb_per_view": 11.364,
+      "supply_p50_delta_ns": -30844,
+      "views": 1000
+    }
+  ],
+  "namei_ext_measured": false,
+  "page_cache": [
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 16744,
+      "condition": "bind_same_source",
+      "trial": 0,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 1127720,
+      "condition": "btrfs_snapshot",
+      "trial": 0,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 18152,
+      "condition": "overlay_same_lower",
+      "trial": 0,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 16648,
+      "condition": "bind_same_source",
+      "trial": 1,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 1132740,
+      "condition": "btrfs_snapshot",
+      "trial": 1,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 17892,
+      "condition": "overlay_same_lower",
+      "trial": 1,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 17256,
+      "condition": "bind_same_source",
+      "trial": 2,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 1132808,
+      "condition": "btrfs_snapshot",
+      "trial": 2,
+      "views": 64
+    },
+    {
+      "bytes_read": 1073741824,
+      "cached_delta_kb": 17852,
+      "condition": "overlay_same_lower",
+      "trial": 2,
+      "views": 64
+    }
+  ],
+  "page_cache_amplification": [
+    {
+      "condition": "overlay_same_lower",
+      "median_ratio_vs_bind": 1.068561872909699,
+      "ratio_ci": [
+        1.0345387111729254,
+        1.0903411821239788
+      ]
+    },
+    {
+      "condition": "btrfs_snapshot",
+      "median_ratio_vs_bind": 67.65050167224081,
+      "ratio_ci": [
+        65.35234121464998,
+        68.0446900528592
+      ]
+    }
+  ],
+  "schema": "namei_ext.view_supply_cost_host.summary.v1",
+  "supply": [
+    {
+      "condition": "btrfs_snapshot",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        796413.5,
+        839898.0
+      ],
+      "mountns_clone_p50_ns": 808751,
+      "samples": 3,
+      "slab_delta_kb_median": 0,
+      "slab_kb_per_view": 0.0,
+      "supply_p50_ci_ns": [
+        25502933,
+        254198168
+      ],
+      "supply_p50_ns": 27804909,
+      "supply_p95_ns": 254198168,
+      "supply_p99_ns": 254198168,
+      "trials": 3,
+      "views": 1
+    },
+    {
+      "condition": "btrfs_snapshot",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        783153.5,
+        824937.0
+      ],
+      "mountns_clone_p50_ns": 807770,
+      "samples": 30,
+      "slab_delta_kb_median": 0,
+      "slab_kb_per_view": 0.0,
+      "supply_p50_ci_ns": [
+        9914255.0,
+        13199354.5
+      ],
+      "supply_p50_ns": 10525134,
+      "supply_p95_ns": 18830886,
+      "supply_p99_ns": 19623490,
+      "trials": 3,
+      "views": 10
+    },
+    {
+      "condition": "btrfs_snapshot",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        790655.0,
+        827314.0
+      ],
+      "mountns_clone_p50_ns": 804790,
+      "samples": 300,
+      "slab_delta_kb_median": 12,
+      "slab_kb_per_view": 0.12,
+      "supply_p50_ci_ns": [
+        10924128.5,
+        12074281.5
+      ],
+      "supply_p50_ns": 11426597,
+      "supply_p95_ns": 20097880,
+      "supply_p99_ns": 22965415,
+      "trials": 3,
+      "views": 100
+    },
+    {
+      "condition": "btrfs_snapshot",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        816883.0,
+        852852.0
+      ],
+      "mountns_clone_p50_ns": 839296,
+      "samples": 3000,
+      "slab_delta_kb_median": 224,
+      "slab_kb_per_view": 0.224,
+      "supply_p50_ci_ns": [
+        13095536.5,
+        13576444.0
+      ],
+      "supply_p50_ns": 13372797,
+      "supply_p95_ns": 21560000,
+      "supply_p99_ns": 26453631,
+      "trials": 3,
+      "views": 1000
+    },
+    {
+      "condition": "control_process",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        765173.5,
+        808272.5
+      ],
+      "mountns_clone_p50_ns": 783031,
+      "samples": 3,
+      "slab_delta_kb_median": 0,
+      "slab_kb_per_view": 0.0,
+      "supply_p50_ci_ns": [
+        662855,
+        802654
+      ],
+      "supply_p50_ns": 685169,
+      "supply_p95_ns": 802654,
+      "supply_p99_ns": 802654,
+      "trials": 3,
+      "views": 1
+    },
+    {
+      "condition": "control_process",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        819968.0,
+        899744.5
+      ],
+      "mountns_clone_p50_ns": 856029,
+      "samples": 30,
+      "slab_delta_kb_median": 0,
+      "slab_kb_per_view": 0.0,
+      "supply_p50_ci_ns": [
+        497472.5,
+        545240.0
+      ],
+      "supply_p50_ns": 508215,
+      "supply_p95_ns": 721124,
+      "supply_p99_ns": 721324,
+      "trials": 3,
+      "views": 10
+    },
+    {
+      "condition": "control_process",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        762711.5,
+        785171.0
+      ],
+      "mountns_clone_p50_ns": 778408,
+      "samples": 300,
+      "slab_delta_kb_median": 7248,
+      "slab_kb_per_view": 72.48,
+      "supply_p50_ci_ns": [
+        582173.5,
+        613694.0
+      ],
+      "supply_p50_ns": 599657,
+      "supply_p95_ns": 756752,
+      "supply_p99_ns": 831539,
+      "trials": 3,
+      "views": 100
+    },
+    {
+      "condition": "control_process",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        807664.0,
+        851248.5
+      ],
+      "mountns_clone_p50_ns": 817994,
+      "samples": 3000,
+      "slab_delta_kb_median": 945488,
+      "slab_kb_per_view": 945.488,
+      "supply_p50_ci_ns": [
+        1912942.5,
+        2052095.5
+      ],
+      "supply_p50_ns": 1978138,
+      "supply_p95_ns": 3517358,
+      "supply_p99_ns": 4299618,
+      "trials": 3,
+      "views": 1000
+    },
+    {
+      "condition": "mountns_bind",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        779162.0,
+        811366.0
+      ],
+      "mountns_clone_p50_ns": 798253,
+      "samples": 3,
+      "slab_delta_kb_median": 0,
+      "slab_kb_per_view": 0.0,
+      "supply_p50_ci_ns": [
+        788019,
+        839814
+      ],
+      "supply_p50_ns": 815484,
+      "supply_p95_ns": 839814,
+      "supply_p99_ns": 839814,
+      "trials": 3,
+      "views": 1
+    },
+    {
+      "condition": "mountns_bind",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        784333.0,
+        835332.0
+      ],
+      "mountns_clone_p50_ns": 795407,
+      "samples": 30,
+      "slab_delta_kb_median": 8,
+      "slab_kb_per_view": 0.8,
+      "supply_p50_ci_ns": [
+        527557.0,
+        610739.0
+      ],
+      "supply_p50_ns": 575035,
+      "supply_p95_ns": 828034,
+      "supply_p99_ns": 879934,
+      "trials": 3,
+      "views": 10
+    },
+    {
+      "condition": "mountns_bind",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        770914.5,
+        818261.0
+      ],
+      "mountns_clone_p50_ns": 793728,
+      "samples": 300,
+      "slab_delta_kb_median": 8516,
+      "slab_kb_per_view": 85.16,
+      "supply_p50_ci_ns": [
+        604879.0,
+        639151.0
+      ],
+      "supply_p50_ns": 621954,
+      "supply_p95_ns": 838800,
+      "supply_p99_ns": 928136,
+      "trials": 3,
+      "views": 100
+    },
+    {
+      "condition": "mountns_bind",
+      "host_mountinfo_lines_after": 51,
+      "mountns_clone_p50_ci_ns": [
+        858307.5,
+        943322.0
+      ],
+      "mountns_clone_p50_ns": 905232,
+      "samples": 3000,
+      "slab_delta_kb_median": 956852,
+      "slab_kb_per_view": 956.852,
+      "supply_p50_ci_ns": [
+        1893038.0,
+        2003012.0
+      ],
+      "supply_p50_ns": 1947294,
+      "supply_p95_ns": 3471965,
+      "supply_p99_ns": 3853472,
+      "trials": 3,
+      "views": 1000
+    },
+    {
+      "condition": "overlayfs_mount",
+      "host_mountinfo_lines_after": 52,
+      "mountns_clone_p50_ci_ns": [
+        785499.0,
+        813500.0
+      ],
+      "mountns_clone_p50_ns": 795775,
+      "samples": 3,
+      "slab_delta_kb_median": 56,
+      "slab_kb_per_view": 56.0,
+      "supply_p50_ci_ns": [
+        525752,
+        715104
+      ],
+      "supply_p50_ns": 666611,
+      "supply_p95_ns": 715104,
+      "supply_p99_ns": 715104,
+      "trials": 3,
+      "views": 1
+    },
+    {
+      "condition": "overlayfs_mount",
+      "host_mountinfo_lines_after": 61,
+      "mountns_clone_p50_ci_ns": [
+        773864.5,
+        798202.0
+      ],
+      "mountns_clone_p50_ns": 780968,
+      "samples": 30,
+      "slab_delta_kb_median": 2088,
+      "slab_kb_per_view": 208.8,
+      "supply_p50_ci_ns": [
+        346759.0,
+        369011.0
+      ],
+      "supply_p50_ns": 357089,
+      "supply_p95_ns": 587797,
+      "supply_p99_ns": 588167,
+      "trials": 3,
+      "views": 10
+    },
+    {
+      "condition": "overlayfs_mount",
+      "host_mountinfo_lines_after": 151,
+      "mountns_clone_p50_ci_ns": [
+        888141.0,
+        921223.5
+      ],
+      "mountns_clone_p50_ns": 905672,
+      "samples": 300,
+      "slab_delta_kb_median": 24612,
+      "slab_kb_per_view": 246.12,
+      "supply_p50_ci_ns": [
+        335863.0,
+        341519.0
+      ],
+      "supply_p50_ns": 338175,
+      "supply_p95_ns": 491321,
+      "supply_p99_ns": 535053,
+      "trials": 3,
+      "views": 100
+    },
+    {
+      "condition": "overlayfs_mount",
+      "host_mountinfo_lines_after": 1051,
+      "mountns_clone_p50_ci_ns": [
+        1800182.5,
+        2066106.0
+      ],
+      "mountns_clone_p50_ns": 1858958,
+      "samples": 3000,
+      "slab_delta_kb_median": 260128,
+      "slab_kb_per_view": 260.128,
+      "supply_p50_ci_ns": [
+        367074.0,
+        369877.0
+      ],
+      "supply_p50_ns": 368380,
+      "supply_p95_ns": 588796,
+      "supply_p99_ns": 660700,
+      "trials": 3,
+      "views": 1000
+    }
+  ],
+  "switch": [
+    {
+      "p50_ci_ns": [
+        1139821.0,
+        1192488.0
+      ],
+      "p50_ns": 1167779,
+      "p95_ns": 1305706,
+      "p99_ns": 2065373,
+      "situation": "idle",
+      "trial": 0
+    },
+    {
+      "situation": "in_use",
+      "trial": 0,
+      "umount_returncode": 32,
+      "umount_stderr": "umount: /root/agent_fs/namei_ext/.build/view-supply-cost-host/scratch/switch/view: target is busy."
+    },
+    {
+      "p50_ci_ns": [
+        1189141.5,
+        1242226.0
+      ],
+      "p50_ns": 1207511,
+      "p95_ns": 1531707,
+      "p99_ns": 2322094,
+      "situation": "idle",
+      "trial": 1
+    },
+    {
+      "situation": "in_use",
+      "trial": 1,
+      "umount_returncode": 32,
+      "umount_stderr": "umount: /root/agent_fs/namei_ext/.build/view-supply-cost-host/scratch/switch/view: target is busy."
+    },
+    {
+      "p50_ci_ns": [
+        1154899.5,
+        1237123.0
+      ],
+      "p50_ns": 1208032,
+      "p95_ns": 1356461,
+      "p99_ns": 1422713,
+      "situation": "idle",
+      "trial": 2
+    },
+    {
+      "situation": "in_use",
+      "trial": 2,
+      "umount_returncode": 32,
+      "umount_stderr": "umount: /root/agent_fs/namei_ext/.build/view-supply-cost-host/scratch/switch/view: target is busy."
+    }
+  ]
+}
