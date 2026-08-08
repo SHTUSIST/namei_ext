@@ -59,6 +59,7 @@ include $(ROOT_DIR)/mk/experiments/fxmark_fast_path.mk
 include $(ROOT_DIR)/mk/experiments/fxmark_readdir.mk
 include $(ROOT_DIR)/mk/experiments/mdtest_cold_metadata.mk
 include $(ROOT_DIR)/mk/experiments/namei_ext_target_lifetime.mk
+include $(ROOT_DIR)/mk/experiments/mount_route_host_baseline.mk
 
 .DEFAULT_GOAL := phase1
 
