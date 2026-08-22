@@ -5,7 +5,6 @@ import csv
 import json
 import math
 import random
-import re
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -38,7 +37,6 @@ ALLOWED_EVENTS = {
 POLICY_COUNTERS = tuple(range(9))
 REQUIRED_POSITIVE_COUNTERS = tuple(range(8))
 BOOTSTRAP_SAMPLES = 10000
-SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def percentile(sorted_values, probability):
@@ -184,6 +182,8 @@ def validate_sample(row, plan):
         "sandboxfs_voluntary_context_switches",
         "sandboxfs_involuntary_context_switches",
         "sandboxfs_vm_hwm_kb",
+        "output_bytes_a",
+        "output_bytes_b",
     )
     if any(type(row.get(field)) is not int for field in integer_fields):
         raise ValueError("sample has a missing integer field")
@@ -192,24 +192,15 @@ def validate_sample(row, plan):
             row["order_index"] < 1 or \
             any(row[field] <= 0
                 for field in ("setup_ns", "action_ns", "lifecycle_ns")) or \
-            any(row[field] < 0 for field in integer_fields[6:]):
+            any(row[field] < 0 for field in integer_fields[6:]) or \
+            row["output_bytes_a"] == 0 or row["output_bytes_b"] == 0:
         raise ValueError("sample has an invalid measurement")
     if row.get("actions") != 2 or row.get("concurrent") is not True or \
+            row.get("output_exact") is not True or \
             row.get("unknown_hidden") is not True or \
             row.get("undeclared_hidden") is not True or \
             row.get("lower_objects_unchanged") is not True:
         raise ValueError("sample correctness oracle is incomplete")
-    hash_fields = (
-        "expected_hash_a",
-        "expected_hash_b",
-        "observed_hash_a",
-        "observed_hash_b",
-    )
-    if any(not SHA256_RE.fullmatch(str(row.get(field, "")))
-           for field in hash_fields) or \
-            row["expected_hash_a"] != row["observed_hash_a"] or \
-            row["expected_hash_b"] != row["observed_hash_b"]:
-        raise ValueError("sample output hash is invalid")
 
 
 def validate(rows, plan):

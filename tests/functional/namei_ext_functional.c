@@ -2,6 +2,8 @@
 
 #define _GNU_SOURCE
 
+#include "namei_ext_harness.h"
+
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <dirent.h>
@@ -20,6 +22,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 struct attached_policy {
@@ -1112,6 +1115,356 @@ static int destroy_policy(struct attached_policy *policy)
 	return err;
 }
 
+static int monotonic_ns(uint64_t *value)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now))
+		return -errno;
+	*value = (uint64_t)now.tv_sec * 1000000000ULL +
+		(uint64_t)now.tv_nsec;
+	return 0;
+}
+
+static int observe_select_targets(FILE *out, const char *phase,
+				  const char *cgroup_root,
+				  const char *select_obj_path,
+				  const char *portal_payload,
+				  const char *selected_file,
+				  const char *selected_exec,
+				  const char *selected_pinned_file,
+				  unsigned int present_mask)
+{
+	const char *paths[] = {
+		portal_payload,
+		selected_file,
+		selected_exec,
+		selected_pinned_file,
+	};
+	const char *labels[] = { "directory", "file", "exec", "pinned" };
+	struct attached_policy policy = {
+		.cgroup_fd = -1,
+		.prog_fd = -1,
+	};
+	char name[128];
+	unsigned int index;
+	int failures = 0;
+	int err;
+
+	if (load_and_attach(select_obj_path, cgroup_root, &policy)) {
+		snprintf(name, sizeof(name), "%s-attach", phase);
+		emit_case(out, name, false, errno, "select policy attach failed");
+		return 1;
+	}
+	for (index = 0; index < sizeof(paths) / sizeof(paths[0]); index++) {
+		if (snprintf(name, sizeof(name), "%s-%s", phase,
+			     labels[index]) < 0) {
+			failures++;
+			continue;
+		}
+		failures += !!expect_stat(name, paths[index],
+					  present_mask & (1U << index) ? 0 : ENOENT,
+					  out);
+	}
+	err = destroy_policy(&policy);
+	if (snprintf(name, sizeof(name), "%s-detach", phase) < 0)
+		return failures + 1;
+	emit_case(out, name, !err, err < 0 ? -err : err,
+		  err ? "select policy detach failed" :
+		  "select policy detached");
+	return failures + !!err;
+}
+
+static int exercise_target_batch(FILE *out, const char *cgroup_root,
+				 const char *functional_root,
+				 const char *select_obj_path,
+				 const char *target_dir,
+				 const char *selected_file_target,
+				 const char *selected_exec_target,
+				 const char *selected_pinned_target,
+				 const char *portal_payload,
+				 const char *selected_file,
+				 const char *selected_exec,
+				 const char *selected_pinned_file)
+{
+	struct namei_ext_target_registration targets[] = {
+		{ .path = target_dir, .target_id = 1 },
+		{ .path = selected_file_target, .target_id = 2 },
+		{ .path = selected_exec_target, .target_id = 3 },
+		{ .path = selected_pinned_target, .target_id = 4 },
+	};
+	struct namei_ext_target_registration partial[2] = {
+		{ .path = target_dir, .target_id = 1 },
+	};
+	char cgroup[PATH_MAX];
+	char missing[PATH_MAX];
+	bool registry_dirty = false;
+	bool moved = false;
+	int failures = 0;
+	int ret;
+
+	if (snprintf(cgroup, sizeof(cgroup), "%s/namei-ext-batch-functional-%ld",
+		     cgroup_root, (long)getpid()) < 0 ||
+	    snprintf(missing, sizeof(missing), "%s/batch-missing", functional_root) < 0)
+		return 1;
+	partial[1].path = missing;
+	partial[1].target_id = 2;
+	if (mkdir(cgroup, 0755)) {
+		emit_case(out, "target_batch_cgroup_create", false, errno,
+			  "batch test cgroup creation failed");
+		return 1;
+	}
+	ret = namei_ext_move_self_to_cgroup(cgroup);
+	if (ret) {
+		emit_case(out, "target_batch_cgroup_enter", false, -ret,
+			  "batch test cgroup move failed");
+		failures++;
+		goto out;
+	}
+	moved = true;
+
+	ret = namei_ext_register_target_batch(cgroup, partial, 2);
+	registry_dirty = true;
+	if (ret) {
+		emit_case(out, "target_batch_partial_failure", true, -ret,
+			  "missing second path rejected after successful prefix");
+	} else {
+		emit_case(out, "target_batch_partial_failure", false, 0,
+			  "missing second path unexpectedly registered");
+		failures++;
+	}
+	failures += observe_select_targets(
+		out, "target-batch-partial-prefix", cgroup_root, select_obj_path,
+		portal_payload, selected_file, selected_exec, selected_pinned_file,
+		1U);
+	ret = namei_ext_clear_targets(cgroup);
+	emit_case(out, "target_batch_partial_clear", !ret,
+		  ret < 0 ? -ret : ret,
+		  ret ? "partial registration clear failed" :
+		  "partial registration cleared");
+	if (ret) {
+		failures++;
+		goto out;
+	}
+	registry_dirty = false;
+	failures += observe_select_targets(
+		out, "target-batch-partial-clear", cgroup_root, select_obj_path,
+		portal_payload, selected_file, selected_exec, selected_pinned_file,
+		0U);
+
+	registry_dirty = true;
+	ret = namei_ext_register_target_batch(
+		cgroup, targets, sizeof(targets) / sizeof(targets[0]));
+	emit_case(out, "target_batch_multi_success", !ret,
+		  ret < 0 ? -ret : ret,
+		  ret ? "multi-target batch failed" :
+		  "multi-target batch registered through one control process");
+	if (ret) {
+		failures++;
+		goto out;
+	}
+	failures += observe_select_targets(
+		out, "target-batch-visible", cgroup_root, select_obj_path,
+		portal_payload, selected_file, selected_exec, selected_pinned_file,
+		0xfU);
+	ret = namei_ext_clear_targets(cgroup);
+	emit_case(out, "target_batch_multi_clear", !ret,
+		  ret < 0 ? -ret : ret,
+		  ret ? "multi-target clear failed" : "multi-target batch cleared");
+	if (ret) {
+		failures++;
+		goto out;
+	}
+	registry_dirty = false;
+	failures += observe_select_targets(
+		out, "target-batch-cleared", cgroup_root, select_obj_path,
+		portal_payload, selected_file, selected_exec, selected_pinned_file,
+		0U);
+
+	registry_dirty = true;
+	ret = namei_ext_register_target_batch(
+		cgroup, targets, sizeof(targets) / sizeof(targets[0]));
+	emit_case(out, "target_batch_id_reuse", !ret,
+		  ret < 0 ? -ret : ret,
+		  ret ? "target ID reuse failed" : "cleared target IDs reused");
+	if (ret) {
+		failures++;
+		goto out;
+	}
+	failures += observe_select_targets(
+		out, "target-batch-reused-visible", cgroup_root, select_obj_path,
+		portal_payload, selected_file, selected_exec, selected_pinned_file,
+		0xfU);
+
+out:
+	if (registry_dirty) {
+		ret = namei_ext_clear_targets(cgroup);
+		emit_case(out, "target_batch_cleanup_clear", !ret,
+			  ret < 0 ? -ret : ret,
+			  ret ? "batch cleanup clear failed" :
+			  "batch cleanup clear completed");
+		failures += !!ret;
+	}
+	if (moved) {
+		ret = namei_ext_move_self_to_cgroup(cgroup_root);
+		emit_case(out, "target_batch_cgroup_leave", !ret,
+			  ret < 0 ? -ret : ret,
+			  ret ? "return to root cgroup failed" :
+			  "returned to root cgroup");
+		failures += !!ret;
+	}
+	ret = rmdir(cgroup);
+	emit_case(out, "target_batch_cgroup_remove", !ret,
+		  ret ? errno : 0,
+		  ret ? "batch test cgroup removal failed" :
+		  "batch test cgroup removed");
+	return failures + !!ret;
+}
+
+#define TARGET_BATCH_DIAGNOSTIC_TARGETS 64U
+#define TARGET_BATCH_DIAGNOSTIC_PAIRS 5U
+
+static int run_registration_arm(FILE *out, const char *cgroup_root,
+				const char *target_path, unsigned int pair,
+				unsigned int order, bool batch,
+				uint64_t *elapsed_out)
+{
+	struct namei_ext_target_registration
+		targets[TARGET_BATCH_DIAGNOSTIC_TARGETS];
+	char cgroup[PATH_MAX];
+	uint64_t start = 0;
+	uint64_t end = 0;
+	unsigned int index;
+	int register_error = 0;
+	int timing_error;
+	int clear_error;
+	int remove_error;
+	bool pass;
+
+	if (snprintf(cgroup, sizeof(cgroup),
+		     "%s/namei-ext-batch-diag-%ld-%u-%u-%s", cgroup_root,
+		     (long)getpid(), pair, order, batch ? "batch" : "scalar") < 0)
+		return 1;
+	if (mkdir(cgroup, 0755))
+		return 1;
+	for (index = 0; index < TARGET_BATCH_DIAGNOSTIC_TARGETS; index++) {
+		targets[index].path = target_path;
+		targets[index].target_id = index + 1;
+	}
+	register_error = monotonic_ns(&start);
+	if (!register_error) {
+		if (batch) {
+			register_error = namei_ext_register_target_batch(
+				cgroup, targets, TARGET_BATCH_DIAGNOSTIC_TARGETS);
+		} else {
+			for (index = 0; index < TARGET_BATCH_DIAGNOSTIC_TARGETS;
+			     index++) {
+				register_error = namei_ext_register_target(
+					cgroup, targets[index].path,
+					targets[index].target_id);
+				if (register_error)
+					break;
+			}
+		}
+	}
+	timing_error = monotonic_ns(&end);
+	if (timing_error && !register_error)
+		register_error = timing_error;
+	*elapsed_out = end >= start ? end - start : 0;
+	clear_error = namei_ext_clear_targets(cgroup);
+	remove_error = rmdir(cgroup) ? -errno : 0;
+	pass = !register_error && !clear_error && !remove_error && *elapsed_out > 0;
+	fprintf(out,
+		"{\"event\":\"target-registration-diagnostic\","
+		"\"pair\":%u,\"order\":%u,\"mechanism\":\"%s\","
+		"\"targets\":%u,\"elapsed_ns\":%llu,"
+		"\"register_error\":%d,\"clear_error\":%d,"
+		"\"cgroup_remove_error\":%d,\"pass\":%s}\n",
+		pair, order, batch ? "batch" : "scalar",
+		TARGET_BATCH_DIAGNOSTIC_TARGETS,
+		(unsigned long long)*elapsed_out,
+		register_error < 0 ? -register_error : register_error,
+		clear_error < 0 ? -clear_error : clear_error,
+		remove_error < 0 ? -remove_error : remove_error,
+		pass ? "true" : "false");
+	fflush(out);
+	return pass ? 0 : 1;
+}
+
+static int compare_double(const void *left, const void *right)
+{
+	double first = *(const double *)left;
+	double second = *(const double *)right;
+
+	return (first > second) - (first < second);
+}
+
+static int run_registration_diagnostic(FILE *out, const char *cgroup_root,
+				       const char *target_path)
+{
+	double ratios[TARGET_BATCH_DIAGNOSTIC_PAIRS];
+	double ordered[TARGET_BATCH_DIAGNOSTIC_PAIRS];
+	unsigned int batch_wins = 0;
+	unsigned int pair;
+	int failures = 0;
+
+	for (pair = 0; pair < TARGET_BATCH_DIAGNOSTIC_PAIRS; pair++) {
+		uint64_t scalar_ns = 0;
+		uint64_t batch_ns = 0;
+		bool batch_first = pair & 1;
+		int first_error;
+		int second_error;
+
+		if (batch_first) {
+			first_error = run_registration_arm(
+				out, cgroup_root, target_path, pair + 1, 1, true,
+				&batch_ns);
+			second_error = run_registration_arm(
+				out, cgroup_root, target_path, pair + 1, 2, false,
+				&scalar_ns);
+		} else {
+			first_error = run_registration_arm(
+				out, cgroup_root, target_path, pair + 1, 1, false,
+				&scalar_ns);
+			second_error = run_registration_arm(
+				out, cgroup_root, target_path, pair + 1, 2, true,
+				&batch_ns);
+		}
+		if (first_error || second_error || !scalar_ns || !batch_ns) {
+			failures++;
+			break;
+		}
+		ratios[pair] = (double)batch_ns / (double)scalar_ns;
+		if (batch_ns < scalar_ns)
+			batch_wins++;
+		fprintf(out,
+			"{\"event\":\"target-registration-pair\","
+			"\"pair\":%u,\"first\":\"%s\",\"targets\":%u,"
+			"\"scalar_ns\":%llu,\"batch_ns\":%llu,"
+			"\"batch_over_scalar\":%.9f,\"pass\":true}\n",
+			pair + 1, batch_first ? "batch" : "scalar",
+			TARGET_BATCH_DIAGNOSTIC_TARGETS,
+			(unsigned long long)scalar_ns,
+			(unsigned long long)batch_ns, ratios[pair]);
+	}
+	if (failures)
+		return failures;
+	memcpy(ordered, ratios, sizeof(ordered));
+	qsort(ordered, TARGET_BATCH_DIAGNOSTIC_PAIRS, sizeof(ordered[0]),
+	      compare_double);
+	bool pass = ordered[TARGET_BATCH_DIAGNOSTIC_PAIRS / 2] < 1.0;
+
+	fprintf(out,
+		"{\"event\":\"target-registration-diagnostic-summary\","
+		"\"pairs\":%u,\"targets\":%u,\"batch_wins\":%u,"
+		"\"median_batch_over_scalar\":%.9f,\"pass\":%s}\n",
+		TARGET_BATCH_DIAGNOSTIC_PAIRS, TARGET_BATCH_DIAGNOSTIC_TARGETS,
+		batch_wins, ordered[TARGET_BATCH_DIAGNOSTIC_PAIRS / 2],
+		pass ? "true" : "false");
+	fflush(out);
+	return pass ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
 	const char *cgroup_path = "/sys/fs/cgroup";
@@ -1434,6 +1787,22 @@ int main(int argc, char **argv)
 	}
 
 	if (select_obj_path) {
+		err = exercise_target_batch(
+			out, cgroup_path, root, select_obj_path, target_dir,
+			selected_file_target, selected_exec_target,
+			selected_pinned_target, portal_payload, selected_file,
+			selected_exec, selected_pinned_file);
+		if (err) {
+			fails++;
+			goto cleanup;
+		}
+		err = run_registration_diagnostic(out, cgroup_path,
+						  selected_file_target);
+		if (err) {
+			fails++;
+			goto cleanup;
+		}
+
 		err = register_target_path(target_dir, 1);
 		if (err) {
 			emit_case(out, "select_register_target", false, -err,

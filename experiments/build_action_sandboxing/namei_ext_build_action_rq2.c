@@ -2,8 +2,6 @@
 
 #define _GNU_SOURCE
 
-#include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -63,6 +61,7 @@ struct process_stats {
 };
 
 struct action_process {
+	const char *name;
 	const char *bazel;
 	const char *workspace;
 	const char *output_base;
@@ -75,6 +74,8 @@ struct action_process {
 	pid_t pid;
 	int setup_fd;
 	int start_fd;
+	int wait_status;
+	bool wait_status_valid;
 };
 
 struct sample_paths {
@@ -277,15 +278,21 @@ static int files_equal(const char *left, const char *right)
 	return ret;
 }
 
-static int wait_child_timeout(pid_t pid, unsigned int timeout_ms)
+static int wait_child_timeout(pid_t pid, unsigned int timeout_ms,
+			      int *status_out)
 {
 	unsigned int elapsed = 0;
+
+	if (status_out)
+		*status_out = -1;
 
 	while (elapsed <= timeout_ms) {
 		int status;
 		pid_t waited = waitpid(pid, &status, WNOHANG);
 
 		if (waited == pid) {
+			if (status_out)
+				*status_out = status;
 			if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
 				return 0;
 			if (WIFEXITED(status))
@@ -303,6 +310,45 @@ static int wait_child_timeout(pid_t pid, unsigned int timeout_ms)
 		elapsed += 10;
 	}
 	return -ETIMEDOUT;
+}
+
+static void record_action_status(struct action_process *action, int status)
+{
+	action->pid = -1;
+	action->wait_status = status;
+	action->wait_status_valid = true;
+}
+
+static int detect_action_exit(struct action_process *action,
+			      struct action_process **failed_action_out)
+{
+	int status;
+	pid_t waited;
+
+	if (!action || action->pid <= 0)
+		return 0;
+	waited = waitpid(action->pid, &status, WNOHANG);
+	if (waited == action->pid) {
+		record_action_status(action, status);
+		*failed_action_out = action;
+		return -EIO;
+	}
+	if (waited < 0 && errno != EINTR) {
+		*failed_action_out = action;
+		return -errno;
+	}
+	return 0;
+}
+
+static int wait_action_timeout(struct action_process *action,
+			       unsigned int timeout_ms)
+{
+	int status;
+	int ret = wait_child_timeout(action->pid, timeout_ms, &status);
+
+	if (status >= 0)
+		record_action_status(action, status);
+	return ret;
 }
 
 static int terminate_child(pid_t pid)
@@ -333,47 +379,113 @@ static int terminate_child(pid_t pid)
 	return 0;
 }
 
-static int sha256_file(const char *path, char output[65])
+static int terminate_action(struct action_process *action)
 {
-	char buffer[128] = {};
-	int pipefd[2];
-	pid_t pid;
-	ssize_t nread;
-	int ret;
-	int index;
+	unsigned int elapsed = 0;
 
-	if (pipe2(pipefd, O_CLOEXEC))
+	if (action->pid <= 0)
+		return 0;
+	if (kill(action->pid, SIGTERM) && errno != ESRCH)
 		return -errno;
-	pid = fork();
-	if (pid < 0) {
+	while (elapsed <= DAEMON_TIMEOUT_MS) {
+		int status;
+		pid_t waited = waitpid(action->pid, &status, WNOHANG);
+
+		if (waited == action->pid) {
+			record_action_status(action, status);
+			return 0;
+		}
+		if (waited < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == ECHILD) {
+				action->pid = -1;
+				return action->wait_status_valid ? 0 : -ECHILD;
+			}
+			return -errno;
+		}
+		usleep(10000);
+		elapsed += 10;
+	}
+	if (kill(action->pid, SIGKILL) && errno != ESRCH)
+		return -errno;
+	for (;;) {
+		int status;
+		pid_t waited = waitpid(action->pid, &status, 0);
+
+		if (waited == action->pid) {
+			record_action_status(action, status);
+			return 0;
+		}
+		if (waited < 0 && errno == EINTR)
+			continue;
+		if (waited < 0 && errno == ECHILD) {
+			action->pid = -1;
+			return action->wait_status_valid ? 0 : -ECHILD;
+		}
+		return -errno;
+	}
+}
+
+static int verify_action_output(const char *path, const char *expected_id,
+				const char *expected_contents,
+				unsigned long long *bytes_out)
+{
+	char output_buffer[8192];
+	char expected_buffer[8192];
+	char *line = NULL;
+	size_t line_capacity = 0;
+	ssize_t line_length;
+	FILE *output = NULL;
+	FILE *expected = NULL;
+	unsigned long long total = 0;
+	int ret = 0;
+
+	output = fopen(path, "r");
+	if (!output)
+		return -errno;
+	expected = fopen(expected_contents, "r");
+	if (!expected) {
 		ret = -errno;
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return ret;
+		goto out;
 	}
-	if (!pid) {
-		if (dup2(pipefd[1], STDOUT_FILENO) < 0)
-			_exit(126);
-		close(pipefd[0]);
-		close(pipefd[1]);
-		execlp("sha256sum", "sha256sum", path, (char *)NULL);
-		_exit(127);
+	line_length = getline(&line, &line_capacity, output);
+	if (line_length < 0 || (size_t)line_length != strlen(expected_id) + 1 ||
+	    memcmp(line, expected_id, strlen(expected_id)) ||
+	    line[line_length - 1] != '\n') {
+		ret = -EIO;
+		goto out;
 	}
-	close(pipefd[1]);
-	nread = read(pipefd[0], buffer, sizeof(buffer) - 1);
-	close(pipefd[0]);
-	ret = wait_child_timeout(pid, 30000);
-	if (ret)
-		return ret;
-	if (nread < 65 || buffer[64] != ' ')
-		return -EIO;
-	for (index = 0; index < 64; index++) {
-		if (!isxdigit((unsigned char)buffer[index]))
-			return -EIO;
-		output[index] = (char)tolower((unsigned char)buffer[index]);
+	total = (unsigned long long)line_length;
+	for (;;) {
+		size_t output_read = fread(output_buffer, 1, sizeof(output_buffer),
+					   output);
+		size_t expected_read = fread(expected_buffer, 1,
+					      sizeof(expected_buffer), expected);
+
+		if (ferror(output) || ferror(expected)) {
+			ret = -EIO;
+			break;
+		}
+		if (output_read != expected_read ||
+		    (output_read && memcmp(output_buffer, expected_buffer,
+					   output_read))) {
+			ret = -EIO;
+			break;
+		}
+		total += output_read;
+		if (!output_read)
+			break;
 	}
-	output[64] = '\0';
-	return 0;
+	if (!ret)
+		*bytes_out = total;
+out:
+	free(line);
+	if (expected && fclose(expected) && !ret)
+		ret = -errno;
+	if (fclose(output) && !ret)
+		ret = -errno;
+	return ret;
 }
 
 static void emit_failure(FILE *out, const char *condition,
@@ -411,10 +523,8 @@ static void emit_sample(FILE *out, const char *condition,
 			unsigned long long lifecycle_ns,
 			const struct process_stats *before,
 			const struct process_stats *after,
-			const char *expected_hash_a,
-			const char *expected_hash_b,
-			const char *observed_hash_a,
-			const char *observed_hash_b)
+			unsigned long long output_bytes_a,
+			unsigned long long output_bytes_b)
 {
 	fprintf(out,
 		"{\"event\":\"build-action-rq2-sample\","
@@ -427,8 +537,8 @@ static void emit_sample(FILE *out, const char *condition,
 		"\"sandboxfs_voluntary_context_switches\":%llu,"
 		"\"sandboxfs_involuntary_context_switches\":%llu,"
 		"\"sandboxfs_vm_hwm_kb\":%llu,"
-		"\"expected_hash_a\":\"%s\",\"expected_hash_b\":\"%s\","
-		"\"observed_hash_a\":\"%s\",\"observed_hash_b\":\"%s\","
+		"\"output_bytes_a\":%llu,\"output_bytes_b\":%llu,"
+		"\"output_exact\":true,"
 		"\"actions\":2,\"concurrent\":true,"
 		"\"unknown_hidden\":true,\"undeclared_hidden\":true,"
 		"\"lower_objects_unchanged\":true,\"pass\":true}\n",
@@ -440,8 +550,7 @@ static void emit_sample(FILE *out, const char *condition,
 			before->voluntary_context_switches,
 		after->involuntary_context_switches -
 			before->involuntary_context_switches,
-		after->vm_hwm_kb, expected_hash_a, expected_hash_b,
-		observed_hash_a, observed_hash_b);
+		after->vm_hwm_kb, output_bytes_a, output_bytes_b);
 	fflush(out);
 }
 
@@ -458,6 +567,32 @@ static void emit_sample_cleanup_failure(FILE *out, const char *condition,
 		"\"errno\":%d,\"pass\":false}\n",
 		condition, repetition, scale, sample, stage,
 		ret < 0 ? -ret : ret);
+	fflush(out);
+}
+
+static void emit_sample_failure(FILE *out, const char *condition,
+				unsigned int repetition, unsigned int scale,
+				unsigned int sample, const char *stage, int ret,
+				const struct action_process *action)
+{
+	int exit_code = -1;
+	int signal_number = 0;
+
+	if (action && action->wait_status_valid) {
+		if (WIFEXITED(action->wait_status))
+			exit_code = WEXITSTATUS(action->wait_status);
+		else if (WIFSIGNALED(action->wait_status))
+			signal_number = WTERMSIG(action->wait_status);
+	}
+	fprintf(out,
+		"{\"event\":\"build-action-rq2-failure\","
+		"\"condition\":\"%s\",\"repetition\":%u,"
+		"\"scale\":%u,\"sample\":%u,\"stage\":\"%s\","
+		"\"errno\":%d,\"action\":\"%s\",\"exit_code\":%d,"
+		"\"signal\":%d,\"pass\":false}\n",
+		condition, repetition, scale, sample, stage,
+		ret < 0 ? -ret : ret, action ? action->name : "",
+		exit_code, signal_number);
 	fflush(out);
 }
 
@@ -623,8 +758,7 @@ out:
 
 static int create_fixture(struct sample_paths *paths, const char *root,
 			  const char *result_dir, unsigned int scale,
-			  unsigned int sample, char hash_a[65],
-			  char hash_b[65])
+			  unsigned int sample)
 {
 	int ret;
 
@@ -647,10 +781,6 @@ static int create_fixture(struct sample_paths *paths, const char *root,
 	if (!ret)
 		ret = create_inputs(paths->lower_b, paths->expected_concat_b, 'B',
 				    scale);
-	if (!ret)
-		ret = sha256_file(paths->expected_concat_a, hash_a);
-	if (!ret)
-		ret = sha256_file(paths->expected_concat_b, hash_b);
 	return ret;
 }
 
@@ -777,11 +907,11 @@ static int write_bazel_workspace(const char *workspace,
 		"test ! -e unknown.txt; "
 		"test -z \\\"$$(find . -mindepth 1 -maxdepth 1 -type f "
 		"-name 'undeclared-*' -print -quit)\\\"; "
-		"hash=$$(find . -mindepth 1 -maxdepth 1 -type f "
+		"printf '%%s\\\\n' '%s' > \\\"$$out\\\"; "
+		"find . -mindepth 1 -maxdepth 1 -type f "
 		"-name 'declared-*.txt' -printf '%%f\\\\n' | "
 		"LC_ALL=C sort | while IFS= read -r f; do cat \\\"$$f\\\"; "
-		"done | sha256sum | awk '{print $$1}'); "
-		"printf '%%s\\\\n%%s\\\\n' '%s' \\\"$$hash\\\" > \\\"$$out\\\"; "
+		"done >> \\\"$$out\\\"; "
 		"printf '%%s' '%s' > '%s'\",\n"
 		")\n",
 		sample_id, started, sample_id, ready, release, logical_action,
@@ -821,7 +951,7 @@ static int spawn_action(struct action_process *action)
 	if (!pid) {
 		char output_base[PATH_MAX + 32];
 		char install_base[PATH_MAX + 32];
-		char signal = 0;
+		char start_signal = 0;
 		int stderr_fd;
 		int stdout_fd;
 
@@ -843,11 +973,11 @@ static int spawn_action(struct action_process *action)
 		close(setup_pipe[1]);
 		do {
 			errno = 0;
-			if (read(start_pipe[0], &signal, 1) == 1)
+			if (read(start_pipe[0], &start_signal, 1) == 1)
 				break;
 		} while (errno == EINTR);
 		close(start_pipe[0]);
-		if (signal != 'G')
+		if (start_signal != 'G')
 			_exit(125);
 		stdout_fd = open(action->stdout_path,
 				 O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
@@ -869,6 +999,8 @@ static int spawn_action(struct action_process *action)
 			     "--install_base=%s", action->install_base) >=
 		    (int)sizeof(install_base))
 			_exit(129);
+		if (signal(SIGPIPE, SIG_DFL) == SIG_ERR)
+			_exit(131);
 		execl(action->bazel, action->bazel, "--batch", output_base,
 		      install_base, "build", "//:result", "--noenable_bzlmod",
 		      "--spawn_strategy=standalone",
@@ -899,6 +1031,7 @@ fork_error:
 
 static int wait_for_action_setup(struct action_process *action_a,
 				 struct action_process *action_b,
+				 struct action_process **failed_action_out,
 				 unsigned int timeout_ms)
 {
 	struct pollfd pollfds[2] = {
@@ -925,8 +1058,10 @@ static int wait_for_action_setup(struct action_process *action_a,
 			if (ready[index] || !pollfds[index].revents)
 				continue;
 			nread = read(pollfds[index].fd, &signal, 1);
-			if (nread != 1 || signal != 'R')
+			if (nread != 1 || signal != 'R') {
+				*failed_action_out = actions[index];
 				return -EIO;
+			}
 			close(pollfds[index].fd);
 			actions[index]->setup_fd = -1;
 			pollfds[index].fd = -1;
@@ -935,18 +1070,14 @@ static int wait_for_action_setup(struct action_process *action_a,
 		if (ready[0] && ready[1])
 			return 0;
 		for (index = 0; index < 2; index++) {
-			int status;
-			pid_t waited;
+			int action_ret;
 
 			if (ready[index])
 				continue;
-			waited = waitpid(actions[index]->pid, &status, WNOHANG);
-			if (waited == actions[index]->pid) {
-				actions[index]->pid = -1;
-				return -EIO;
-			}
-			if (waited < 0 && errno != EINTR)
-				return -errno;
+			action_ret = detect_action_exit(actions[index],
+						failed_action_out);
+			if (action_ret)
+				return action_ret;
 		}
 		elapsed += 100;
 	}
@@ -981,25 +1112,22 @@ static void close_action_control(struct action_process *action)
 static int wait_for_paths(const char *first, const char *second,
 			  struct action_process *action_a,
 			  struct action_process *action_b,
+			  struct action_process **failed_action_out,
 			  unsigned int timeout_ms)
 {
 	unsigned int elapsed = 0;
 
 	while (elapsed <= timeout_ms) {
-		int status;
+		int ret;
 
 		if (!access(first, F_OK) && !access(second, F_OK))
 			return 0;
-		if (action_a && action_a->pid > 0 &&
-		    waitpid(action_a->pid, &status, WNOHANG) == action_a->pid) {
-			action_a->pid = -1;
-			return -EIO;
-		}
-		if (action_b && action_b->pid > 0 &&
-		    waitpid(action_b->pid, &status, WNOHANG) == action_b->pid) {
-			action_b->pid = -1;
-			return -EIO;
-		}
+		ret = detect_action_exit(action_a, failed_action_out);
+		if (ret)
+			return ret;
+		ret = detect_action_exit(action_b, failed_action_out);
+		if (ret)
+			return ret;
 		usleep(10000);
 		elapsed += 10;
 	}
@@ -1010,6 +1138,7 @@ static int wait_for_paths_inotify(int inotify_fd, const char *first,
 				  const char *second,
 				  struct action_process *action_a,
 				  struct action_process *action_b,
+				  struct action_process **failed_action_out,
 				  unsigned int timeout_ms)
 {
 	const char *first_name = strrchr(first, '/');
@@ -1032,7 +1161,6 @@ static int wait_for_paths_inotify(int inotify_fd, const char *first,
 		ssize_t length;
 		ssize_t offset;
 		int ret;
-		int status;
 
 		if (!access(first, F_OK))
 			first_seen = true;
@@ -1069,52 +1197,19 @@ static int wait_for_paths_inotify(int inotify_fd, const char *first,
 			if (first_seen && second_seen)
 				return 0;
 		}
-		if (!first_seen && action_a && action_a->pid > 0 &&
-		    waitpid(action_a->pid, &status, WNOHANG) == action_a->pid) {
-			action_a->pid = -1;
-			return -EIO;
+		if (!first_seen) {
+			ret = detect_action_exit(action_a, failed_action_out);
+			if (ret)
+				return ret;
 		}
-		if (!second_seen && action_b && action_b->pid > 0 &&
-		    waitpid(action_b->pid, &status, WNOHANG) == action_b->pid) {
-			action_b->pid = -1;
-			return -EIO;
+		if (!second_seen) {
+			ret = detect_action_exit(action_b, failed_action_out);
+			if (ret)
+				return ret;
 		}
 		elapsed += 100;
 	}
 	return -ETIMEDOUT;
-}
-
-static int parse_action_output(const char *path, const char *expected_id,
-			       char observed_hash[65])
-{
-	char buffer[256];
-	char *first_newline;
-	char *second_newline;
-	size_t index;
-	int ret;
-
-	ret = read_text(path, buffer, sizeof(buffer));
-	if (ret)
-		return ret;
-	first_newline = strchr(buffer, '\n');
-	if (!first_newline)
-		return -EIO;
-	*first_newline = '\0';
-	second_newline = strchr(first_newline + 1, '\n');
-	if (!second_newline || second_newline[1] != '\0' ||
-	    strcmp(buffer, expected_id) ||
-	    second_newline - (first_newline + 1) != 64)
-		return -EIO;
-	for (index = 0; index < 64; index++) {
-		char value = first_newline[1 + index];
-
-		if (!isxdigit((unsigned char)value) ||
-		    (value >= 'A' && value <= 'F'))
-			return -EIO;
-		observed_hash[index] = value;
-	}
-	observed_hash[64] = '\0';
-	return 0;
 }
 
 static int read_process_stats(pid_t pid, struct process_stats *stats)
@@ -1250,9 +1345,11 @@ static int start_sandboxfs(struct sandboxfs_process *process,
 		close(input_pipe[1]);
 		close(output_pipe[0]);
 		close(output_pipe[1]);
+		if (signal(SIGPIPE, SIG_DFL) == SIG_ERR)
+			_exit(123);
 		execl(binary, binary, "--input=-", "--output=-",
-		      "--reconfig_threads=1", "--ttl=0s", mountpoint,
-		      (char *)NULL);
+			      "--reconfig_threads=1", mountpoint,
+			      (char *)NULL);
 		_exit(122);
 	}
 	close(input_pipe[0]);
@@ -1363,29 +1460,9 @@ static int sandboxfs_create(struct sandboxfs_process *process,
 	return expect_sandboxfs_ack(process, id);
 }
 
-static bool directory_contains(const char *directory, const char *name)
-{
-	struct dirent *entry;
-	DIR *dir = opendir(directory);
-	bool found = false;
-
-	if (!dir)
-		return false;
-	while ((entry = readdir(dir))) {
-		if (!strcmp(entry->d_name, name)) {
-			found = true;
-			break;
-		}
-	}
-	closedir(dir);
-	return found;
-}
-
 static int sandboxfs_destroy(struct sandboxfs_process *process, const char *id)
 {
 	char request[RESPONSE_MAX];
-	char path[PATH_MAX];
-	struct stat st;
 	int length;
 	int ret;
 
@@ -1396,15 +1473,7 @@ static int sandboxfs_destroy(struct sandboxfs_process *process, const char *id)
 	ret = write_all(process->input_fd, request, (size_t)length);
 	if (!ret)
 		ret = expect_sandboxfs_ack(process, id);
-	if (ret)
-		return ret;
-	ret = namei_ext_path_join(path, sizeof(path), process->mountpoint, id);
-	if (ret)
-		return ret;
-	errno = 0;
-	if (!lstat(path, &st) || errno != ENOENT)
-		return -EIO;
-	return directory_contains(process->mountpoint, id) ? -EIO : 0;
+	return ret;
 }
 
 static int run_fusermount_unmount(const char *mountpoint)
@@ -1414,11 +1483,13 @@ static int run_fusermount_unmount(const char *mountpoint)
 	if (pid < 0)
 		return -errno;
 	if (!pid) {
+		if (signal(SIGPIPE, SIG_DFL) == SIG_ERR)
+			_exit(126);
 		execlp("fusermount", "fusermount", "-u", mountpoint,
 		       (char *)NULL);
 		_exit(127);
 	}
-	return wait_child_timeout(pid, DAEMON_TIMEOUT_MS);
+	return wait_child_timeout(pid, DAEMON_TIMEOUT_MS, NULL);
 }
 
 static int stop_sandboxfs(struct sandboxfs_process *process)
@@ -1435,7 +1506,8 @@ static int stop_sandboxfs(struct sandboxfs_process *process)
 	if (!ret && child_ret)
 		ret = child_ret;
 	if (process->pid > 0) {
-		child_ret = wait_child_timeout(process->pid, DAEMON_TIMEOUT_MS);
+		child_ret = wait_child_timeout(process->pid, DAEMON_TIMEOUT_MS,
+					       NULL);
 		if (child_ret == -ETIMEDOUT)
 			terminate_child(process->pid);
 		if (!ret && child_ret)
@@ -1647,19 +1719,23 @@ static int run_sample(FILE *out, const char *condition,
 		      const char *bazel, const char *install_base_a,
 		      const char *install_base_b,
 		      struct namei_ext_harness_policy *policy,
-		      struct sandboxfs_process *sandboxfs)
+		      struct sandboxfs_process *sandboxfs,
+		      bool *failure_emitted_out)
 {
 	struct sample_paths *paths;
 	struct action_process action_a = {
+		.name = "a",
 		.pid = -1,
 		.setup_fd = -1,
 		.start_fd = -1,
 	};
 	struct action_process action_b = {
+		.name = "b",
 		.pid = -1,
 		.setup_fd = -1,
 		.start_fd = -1,
 	};
+	struct action_process *failed_action = NULL;
 	struct process_stats daemon_before = {};
 	struct process_stats daemon_after = {};
 	char sandbox_id_a[64] = {};
@@ -1668,11 +1744,9 @@ static int run_sample(FILE *out, const char *condition,
 	char sandbox_view_b[PATH_MAX] = {};
 	char sample_id_a[128];
 	char sample_id_b[128];
-	char hash_a[65];
-	char hash_b[65];
-	char observed_hash_a[65] = {};
-	char observed_hash_b[65] = {};
 	char unknown_path[PATH_MAX];
+	unsigned long long output_bytes_a = 0;
+	unsigned long long output_bytes_b = 0;
 	unsigned long long lifecycle_start;
 	unsigned long long setup_start = 0;
 	unsigned long long setup_end = 0;
@@ -1682,46 +1756,63 @@ static int run_sample(FILE *out, const char *condition,
 	bool namei = !strcmp(condition, "namei_ext");
 	bool view_a_created = false;
 	bool view_b_created = false;
+	bool controlling_failure_emitted = false;
+	const char *failure_stage = "sample-allocate";
 	int finish_fd = -1;
 	int rollback_error;
 	int ret;
 	int cleanup_ret;
 
+	*failure_emitted_out = false;
 	paths = calloc(1, sizeof(*paths));
-	if (!paths)
-		return -errno;
+	if (!paths) {
+		ret = -errno;
+		emit_sample_failure(out, condition, repetition, scale, sample,
+				    failure_stage, ret, NULL);
+		*failure_emitted_out = true;
+		return ret;
+	}
 	lifecycle_start = nsec_now();
-	ret = create_fixture(paths, root, result_dir, scale, sample, hash_a,
-			     hash_b);
+	failure_stage = "fixture-create";
+	ret = create_fixture(paths, root, result_dir, scale, sample);
 	if (ret)
 		goto out;
+	failure_stage = "sample-id-a";
 	ret = format_string(sample_id_a, sizeof(sample_id_a),
 			    "r%02u-scale%06u-s%03u-a", repetition, scale,
 			    sample);
-	if (!ret)
+	if (!ret) {
+		failure_stage = "sample-id-b";
 		ret = format_string(sample_id_b, sizeof(sample_id_b),
 				    "r%02u-scale%06u-s%03u-b", repetition,
 				    scale, sample);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "bazel-workspace-a";
 		ret = write_bazel_workspace(
 			paths->workspace_a, logical_action, sample_id_a,
 			paths->started_a, paths->ready_a, paths->release,
 			paths->finished_a, scale);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "bazel-workspace-b";
 		ret = write_bazel_workspace(
 			paths->workspace_b, logical_action, sample_id_b,
 			paths->started_b, paths->ready_b, paths->release,
 			paths->finished_b, scale);
+	}
 	if (ret)
 		goto out;
 
 	if (!namei) {
+		failure_stage = "sandboxfs-stats-before";
 		ret = read_process_stats(sandboxfs->pid, &daemon_before);
 		if (ret)
 			goto out;
 	}
 	setup_start = nsec_now();
 	if (namei) {
+		failure_stage = "namei-view-a-setup";
 		ret = add_namei_view(policy, cgroup_id_a, cgroup_a, view,
 				     paths->lower_a, scale, &rollback_error);
 		if (rollback_error)
@@ -1731,6 +1822,7 @@ static int run_sample(FILE *out, const char *condition,
 		if (!ret)
 			view_a_created = true;
 		if (!ret) {
+			failure_stage = "namei-view-b-setup";
 			ret = add_namei_view(policy, cgroup_id_b, cgroup_b, view,
 					     paths->lower_b, scale, &rollback_error);
 			if (rollback_error)
@@ -1742,36 +1834,48 @@ static int run_sample(FILE *out, const char *condition,
 		if (!ret)
 			view_b_created = true;
 	} else {
+		failure_stage = "sandbox-id-a";
 		ret = format_string(sandbox_id_a, sizeof(sandbox_id_a),
 				    "r%02u-n%06u-s%03u-a", repetition, scale,
 				    sample);
-		if (!ret)
+		if (!ret) {
+			failure_stage = "sandbox-id-b";
 			ret = format_string(sandbox_id_b, sizeof(sandbox_id_b),
 					    "r%02u-n%06u-s%03u-b",
 					    repetition, scale, sample);
-		if (!ret)
+		}
+		if (!ret) {
+			failure_stage = "sandbox-a-create";
 			ret = sandboxfs_create(sandboxfs, sandbox_id_a,
 					       paths->lower_a, scale);
+		}
 		if (!ret)
 			view_a_created = true;
-		if (!ret)
+		if (!ret) {
+			failure_stage = "sandbox-b-create";
 			ret = sandboxfs_create(sandboxfs, sandbox_id_b,
 					       paths->lower_b, scale);
+		}
 		if (!ret)
 			view_b_created = true;
-		if (!ret)
+		if (!ret) {
+			failure_stage = "sandbox-view-a-path";
 			ret = namei_ext_path_join(
 				sandbox_view_a, sizeof(sandbox_view_a),
 				sandboxfs->mountpoint, sandbox_id_a);
-		if (!ret)
+		}
+		if (!ret) {
+			failure_stage = "sandbox-view-b-path";
 			ret = namei_ext_path_join(
 				sandbox_view_b, sizeof(sandbox_view_b),
 				sandboxfs->mountpoint, sandbox_id_b);
+		}
 	}
 	if (ret)
 		goto teardown;
 
 	action_a = (struct action_process){
+		.name = "a",
 		.bazel = bazel,
 		.workspace = paths->workspace_a,
 		.output_base = paths->output_base_a,
@@ -1786,6 +1890,7 @@ static int run_sample(FILE *out, const char *condition,
 		.start_fd = -1,
 	};
 	action_b = (struct action_process){
+		.name = "b",
 		.bazel = bazel,
 		.workspace = paths->workspace_b,
 		.output_base = paths->output_base_b,
@@ -1799,59 +1904,95 @@ static int run_sample(FILE *out, const char *condition,
 		.setup_fd = -1,
 		.start_fd = -1,
 	};
+	failure_stage = "action-a-spawn";
+	failed_action = &action_a;
 	ret = spawn_action(&action_a);
-	if (!ret)
+	if (!ret) {
+		failure_stage = "action-b-spawn";
+		failed_action = &action_b;
 		ret = spawn_action(&action_b);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "action-setup";
+		failed_action = NULL;
 		ret = wait_for_action_setup(&action_a, &action_b,
+					    &failed_action,
 					    ACTION_TIMEOUT_MS);
+	}
 	setup_end = nsec_now();
 	if (ret)
 		goto wait_actions;
 
+	failure_stage = "unknown-a-path";
 	ret = namei_ext_path_join(unknown_path, sizeof(unknown_path),
 				  paths->lower_a, "unknown.txt");
-	if (!ret)
+	if (!ret) {
+		failure_stage = "unknown-a-create";
 		ret = namei_ext_write_text(unknown_path,
 					    "unknown-after-setup\n");
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "unknown-b-path";
 		ret = namei_ext_path_join(unknown_path, sizeof(unknown_path),
 					  paths->lower_b, "unknown.txt");
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "unknown-b-create";
 		ret = namei_ext_write_text(unknown_path,
 					    "unknown-after-setup\n");
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-a-before";
 		ret = write_lower_manifest(paths->lower_a,
 					   paths->manifest_a_before, scale);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-b-before";
 		ret = write_lower_manifest(paths->lower_b,
 					   paths->manifest_b_before, scale);
+	}
 	if (ret)
 		goto wait_actions;
+	failure_stage = "action-a-release";
+	failed_action = &action_a;
 	ret = release_action_setup(&action_a);
-	if (!ret)
+	if (!ret) {
+		failure_stage = "action-b-release";
+		failed_action = &action_b;
 		ret = release_action_setup(&action_b);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "action-ready";
+		failed_action = NULL;
 		ret = wait_for_paths(paths->ready_a, paths->ready_b,
-				     &action_a, &action_b, ACTION_TIMEOUT_MS);
+				     &action_a, &action_b, &failed_action,
+				     ACTION_TIMEOUT_MS);
+	}
 	if (ret)
 		goto wait_actions;
+	failure_stage = "finish-inotify-init";
 	finish_fd = inotify_init1(IN_CLOEXEC);
 	if (finish_fd < 0) {
 		ret = -errno;
 		goto wait_actions;
 	}
+	failure_stage = "finish-inotify-watch";
 	if (inotify_add_watch(finish_fd, paths->sample_root,
 			      IN_CLOSE_WRITE) < 0) {
 		ret = -errno;
 		goto wait_actions;
 	}
 	action_start = nsec_now();
+	failure_stage = "action-barrier-release";
 	ret = namei_ext_write_text(paths->release, "release\n");
-	if (!ret)
+	if (!ret) {
+		failure_stage = "action-finished";
+		failed_action = NULL;
 		ret = wait_for_paths_inotify(
 			finish_fd, paths->finished_a, paths->finished_b,
-			&action_a, &action_b, ACTION_TIMEOUT_MS);
+			&action_a, &action_b, &failed_action,
+			ACTION_TIMEOUT_MS);
+	}
 	action_end = nsec_now();
 wait_actions:
 	if (finish_fd >= 0) {
@@ -1862,50 +2003,69 @@ wait_actions:
 	close_action_control(&action_b);
 	if (action_a.pid > 0) {
 		if (ret)
-			cleanup_ret = terminate_child(action_a.pid);
-		else
-			cleanup_ret = wait_child_timeout(action_a.pid,
-							 ACTION_TIMEOUT_MS);
+			cleanup_ret = terminate_action(&action_a);
+		else {
+			failure_stage = "action-a-reap";
+			failed_action = &action_a;
+			cleanup_ret = wait_action_timeout(&action_a,
+						  ACTION_TIMEOUT_MS);
+		}
 		if (cleanup_ret == -ETIMEDOUT) {
-			int terminate_ret = terminate_child(action_a.pid);
+			int terminate_ret = terminate_action(&action_a);
 
 			if (terminate_ret)
 				emit_sample_cleanup_failure(
 					out, condition, repetition, scale, sample,
 					"action-a-force-terminate", terminate_ret);
 		}
-		action_a.pid = -1;
-		if (cleanup_ret)
+		if (action_a.pid > 0)
+			action_a.pid = -1;
+		if (cleanup_ret && !ret) {
+			emit_sample_failure(out, condition, repetition, scale,
+					    sample, failure_stage, cleanup_ret,
+					    failed_action);
+			controlling_failure_emitted = true;
+			ret = cleanup_ret;
+		} else if (cleanup_ret) {
 			emit_sample_cleanup_failure(
 				out, condition, repetition, scale, sample,
 				"action-a-reap", cleanup_ret);
-		if (!ret && cleanup_ret)
-			ret = cleanup_ret;
+		}
 	}
 	if (action_b.pid > 0) {
 		if (ret)
-			cleanup_ret = terminate_child(action_b.pid);
-		else
-			cleanup_ret = wait_child_timeout(action_b.pid,
-							 ACTION_TIMEOUT_MS);
+			cleanup_ret = terminate_action(&action_b);
+		else {
+			failure_stage = "action-b-reap";
+			failed_action = &action_b;
+			cleanup_ret = wait_action_timeout(&action_b,
+						  ACTION_TIMEOUT_MS);
+		}
 		if (cleanup_ret == -ETIMEDOUT) {
-			int terminate_ret = terminate_child(action_b.pid);
+			int terminate_ret = terminate_action(&action_b);
 
 			if (terminate_ret)
 				emit_sample_cleanup_failure(
 					out, condition, repetition, scale, sample,
 					"action-b-force-terminate", terminate_ret);
 		}
-		action_b.pid = -1;
-		if (cleanup_ret)
+		if (action_b.pid > 0)
+			action_b.pid = -1;
+		if (cleanup_ret && !ret) {
+			emit_sample_failure(out, condition, repetition, scale,
+					    sample, failure_stage, cleanup_ret,
+					    failed_action);
+			controlling_failure_emitted = true;
+			ret = cleanup_ret;
+		} else if (cleanup_ret) {
 			emit_sample_cleanup_failure(
 				out, condition, repetition, scale, sample,
 				"action-b-reap", cleanup_ret);
-		if (!ret && cleanup_ret)
-			ret = cleanup_ret;
+		}
 	}
 	if (ret)
 		goto teardown;
+	failure_stage = "action-markers";
 	if (!path_text_equals(paths->started_a, sample_id_a) ||
 	    !path_text_equals(paths->started_b, sample_id_b) ||
 	    !path_text_equals(paths->finished_a, sample_id_a) ||
@@ -1913,35 +2073,51 @@ wait_actions:
 		ret = -EIO;
 		goto teardown;
 	}
-	ret = parse_action_output(paths->bazel_output_a, sample_id_a,
-				  observed_hash_a);
-	if (!ret)
-		ret = parse_action_output(paths->bazel_output_b, sample_id_b,
-					  observed_hash_b);
-	if (!ret && (strcmp(observed_hash_a, hash_a) ||
-		     strcmp(observed_hash_b, hash_b)))
-		ret = -EIO;
+	failure_stage = "action-output-a";
+	ret = verify_action_output(paths->bazel_output_a, sample_id_a,
+				   paths->expected_concat_a, &output_bytes_a);
+	if (!ret) {
+		failure_stage = "action-output-b";
+		ret = verify_action_output(paths->bazel_output_b, sample_id_b,
+					   paths->expected_concat_b,
+					   &output_bytes_b);
+	}
 	if (ret)
 		goto teardown;
+	failure_stage = "action-output-a-save";
 	ret = copy_file(paths->bazel_output_a, paths->saved_output_a);
-	if (!ret)
+	if (!ret) {
+		failure_stage = "action-output-b-save";
 		ret = copy_file(paths->bazel_output_b, paths->saved_output_b);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-a-after";
 		ret = write_lower_manifest(paths->lower_a,
 					   paths->manifest_a_after, scale);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-b-after";
 		ret = write_lower_manifest(paths->lower_b,
 					   paths->manifest_b_after, scale);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-a-metadata";
 		ret = files_equal(paths->manifest_a_before,
 				  paths->manifest_a_after);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-b-metadata";
 		ret = files_equal(paths->manifest_b_before,
 				  paths->manifest_b_after);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-a-contents";
 		ret = verify_lower_contents(paths->lower_a, 'A', scale);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "lower-b-contents";
 		ret = verify_lower_contents(paths->lower_b, 'B', scale);
+	}
 
 teardown:
 	if (namei) {
@@ -1953,8 +2129,10 @@ teardown:
 				emit_sample_cleanup_failure(
 					out, condition, repetition, scale, sample,
 					"namei-view-b-remove", cleanup_ret);
-			if (!ret && cleanup_ret)
+			if (!ret && cleanup_ret) {
 				ret = cleanup_ret;
+				controlling_failure_emitted = true;
+			}
 		}
 		if (view_a_created) {
 			cleanup_ret = remove_namei_view(
@@ -1964,8 +2142,10 @@ teardown:
 				emit_sample_cleanup_failure(
 					out, condition, repetition, scale, sample,
 					"namei-view-a-remove", cleanup_ret);
-			if (!ret && cleanup_ret)
+			if (!ret && cleanup_ret) {
 				ret = cleanup_ret;
+				controlling_failure_emitted = true;
+			}
 		}
 	} else {
 		if (view_b_created) {
@@ -1974,8 +2154,10 @@ teardown:
 				emit_sample_cleanup_failure(
 					out, condition, repetition, scale, sample,
 					"sandbox-b-destroy", cleanup_ret);
-			if (!ret && cleanup_ret)
+			if (!ret && cleanup_ret) {
 				ret = cleanup_ret;
+				controlling_failure_emitted = true;
+			}
 		}
 		if (view_a_created) {
 			cleanup_ret = sandboxfs_destroy(sandboxfs, sandbox_id_a);
@@ -1983,16 +2165,20 @@ teardown:
 				emit_sample_cleanup_failure(
 					out, condition, repetition, scale, sample,
 					"sandbox-a-destroy", cleanup_ret);
-			if (!ret && cleanup_ret)
+			if (!ret && cleanup_ret) {
 				ret = cleanup_ret;
+				controlling_failure_emitted = true;
+			}
 		}
 		cleanup_ret = read_process_stats(sandboxfs->pid, &daemon_after);
 		if (cleanup_ret)
 			emit_sample_cleanup_failure(
 				out, condition, repetition, scale, sample,
 				"sandboxfs-stats-after", cleanup_ret);
-		if (!ret && cleanup_ret)
+		if (!ret && cleanup_ret) {
 			ret = cleanup_ret;
+			controlling_failure_emitted = true;
+		}
 	}
 	lifecycle_end = nsec_now();
 	if (!ret) {
@@ -2000,10 +2186,15 @@ teardown:
 			    order_index, setup_end - setup_start,
 			    action_end - action_start,
 			    lifecycle_end - lifecycle_start, &daemon_before,
-			    &daemon_after, hash_a, hash_b, observed_hash_a,
-			    observed_hash_b);
+			    &daemon_after, output_bytes_a, output_bytes_b);
 	}
 out:
+	if (ret) {
+		if (!controlling_failure_emitted)
+			emit_sample_failure(out, condition, repetition, scale, sample,
+					    failure_stage, ret, failed_action);
+		*failure_emitted_out = true;
+	}
 	free(paths);
 	return ret;
 }
@@ -2051,6 +2242,8 @@ int main(int argc, char **argv)
 	bool cgroup_b_created = false;
 	bool policy_loaded = false;
 	bool sandbox_started = false;
+	bool sample_failure_emitted = false;
+	const char *failure_stage = "runner-paths";
 	FILE *out;
 	char *end;
 	size_t offset;
@@ -2111,6 +2304,11 @@ int main(int argc, char **argv)
 		perror("fopen result");
 		return 2;
 	}
+	failure_stage = "sigpipe-ignore";
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		ret = -errno;
+		goto fail;
+	}
 	if (!mkdtemp(root)) {
 		emit_failure(out, condition, repetition, "mkdtemp", -errno);
 		fclose(out);
@@ -2147,6 +2345,7 @@ int main(int argc, char **argv)
 				    cgroup_root, (long)getpid());
 	if (ret)
 		goto fail;
+	failure_stage = "runner-directories";
 	ret = mkdir_one(view);
 	if (!ret)
 		ret = mkdir_one(logical_action);
@@ -2160,23 +2359,31 @@ int main(int argc, char **argv)
 		ret = mkdir_one(cgroup_b);
 	if (!ret)
 		cgroup_b_created = true;
-	if (!ret)
+	if (!ret) {
+		failure_stage = "cgroup-a-id";
 		ret = namei_ext_cgroup_id(cgroup_a, &cgroup_id_a);
-	if (!ret)
+	}
+	if (!ret) {
+		failure_stage = "cgroup-b-id";
 		ret = namei_ext_cgroup_id(cgroup_b, &cgroup_id_b);
+	}
 	if (ret)
 		goto fail;
 
 	if (namei) {
+		failure_stage = "policy-load-attach";
 		ret = namei_ext_policy_load_attach(policy_path, cgroup_root,
 						    &policy);
 		if (!ret)
 			policy_loaded = true;
-		if (!ret && capacity)
+		if (!ret && capacity) {
+			failure_stage = "capacity-probe";
 			ret = capacity_probe(out, &policy, cgroup_id_a,
 					     logical_action, condition, repetition,
 					     capacity);
+		}
 	} else {
+		failure_stage = "sandboxfs-start";
 		ret = start_sandboxfs(&sandboxfs, sandboxfs_binary,
 				      sandbox_mount, sandbox_stderr);
 		if (!ret)
@@ -2184,6 +2391,7 @@ int main(int argc, char **argv)
 	}
 	if (ret)
 		goto fail;
+	failure_stage = "external-release";
 	ret = wait_external_release(external_ready, external_release);
 	if (ret)
 		goto fail;
@@ -2195,12 +2403,13 @@ int main(int argc, char **argv)
 
 		for (sample = 1; sample <= samples; sample++) {
 			order_index++;
+			sample_failure_emitted = false;
 			ret = run_sample(out, condition, repetition, scale,
 					 sample, order_index, root, result_dir,
 					 logical_action, view, cgroup_a, cgroup_b,
 					 cgroup_id_a, cgroup_id_b, bazel,
 					 install_base_a, install_base_b, &policy,
-					 &sandboxfs);
+					 &sandboxfs, &sample_failure_emitted);
 			if (ret)
 				break;
 		}
@@ -2212,6 +2421,7 @@ int main(int argc, char **argv)
 			uint64_t value = 0;
 			bool required = index != BAS_COUNTER_PASS;
 
+			failure_stage = "policy-counter";
 			ret = namei_ext_policy_counter(
 				&policy, "build_action_sandboxing_counters",
 				(uint32_t)index, &value);
@@ -2228,9 +2438,8 @@ int main(int argc, char **argv)
 	}
 
 fail:
-	if (ret) {
-		emit_failure(out, condition, repetition, "run", ret);
-	}
+	if (ret && !sample_failure_emitted)
+		emit_failure(out, condition, repetition, failure_stage, ret);
 	if (policy_loaded) {
 		cleanup_ret = namei_ext_policy_destroy(&policy);
 		if (cleanup_ret)

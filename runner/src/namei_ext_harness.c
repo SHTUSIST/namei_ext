@@ -291,44 +291,82 @@ int namei_ext_cgroup_id(const char *path, uint64_t *id_out)
 	return 0;
 }
 
-int namei_ext_register_target(const char *cgroup_path,
-			       const char *target_path, uint32_t target_id)
+static int namei_ext_register_target_fd(
+	int register_fd, const struct namei_ext_target_registration *target)
 {
-	pid_t pid = fork();
+	char register_buf[64];
+	ssize_t nwritten;
+	int target_fd;
+	int len;
+	int ret = 0;
 
+	target_fd = open(target->path, O_PATH | O_CLOEXEC);
+	if (target_fd < 0)
+		return -errno;
+	len = snprintf(register_buf, sizeof(register_buf), "%u %d\n",
+		       target->target_id, target_fd);
+	if (len < 0 || (size_t)len >= sizeof(register_buf)) {
+		ret = -EOVERFLOW;
+		goto out_close;
+	}
+	nwritten = write(register_fd, register_buf, len);
+	if (nwritten != len)
+		ret = -(errno ? errno : EIO);
+out_close:
+	if (close(target_fd) && !ret)
+		ret = -errno;
+	return ret;
+}
+
+int namei_ext_register_target_batch(
+	const char *cgroup_path,
+	const struct namei_ext_target_registration *targets,
+	size_t target_count)
+{
+	pid_t pid;
+	size_t index;
+
+	if (!cgroup_path || !targets || !target_count)
+		return -EINVAL;
+	for (index = 0; index < target_count; index++) {
+		if (!targets[index].path || !targets[index].path[0] ||
+		    !targets[index].target_id)
+			return -EINVAL;
+	}
+
+	pid = fork();
 	if (pid < 0)
 		return -errno;
 	if (!pid) {
-		char register_buf[64];
-		ssize_t nwritten;
 		int register_fd;
-		int target_fd;
-		int len;
 
 		if (namei_ext_move_self_to_cgroup(cgroup_path))
 			_exit(1);
-		target_fd = open(target_path, O_PATH | O_CLOEXEC);
-		if (target_fd < 0)
-			_exit(1);
 		register_fd = open("/sys/kernel/debug/namei_ext/register_target",
 				   O_WRONLY | O_CLOEXEC);
-		if (register_fd < 0) {
-			close(target_fd);
+		if (register_fd < 0)
 			_exit(1);
+		for (index = 0; index < target_count; index++) {
+			if (namei_ext_register_target_fd(register_fd,
+						       &targets[index])) {
+				close(register_fd);
+				_exit(1);
+			}
 		}
-		len = snprintf(register_buf, sizeof(register_buf), "%u %d\n",
-			       target_id, target_fd);
-		if (len < 0 || (size_t)len >= sizeof(register_buf)) {
-			close(register_fd);
-			close(target_fd);
-			_exit(1);
-		}
-		nwritten = write(register_fd, register_buf, len);
-		close(register_fd);
-		close(target_fd);
-		_exit(nwritten == len ? 0 : 1);
+		_exit(close(register_fd) ? 1 : 0);
 	}
 	return namei_ext_wait_control_child(pid);
+}
+
+int namei_ext_register_target(const char *cgroup_path,
+			       const char *target_path, uint32_t target_id)
+{
+	const struct namei_ext_target_registration target = {
+		.path = target_path,
+		.target_id = target_id,
+	};
+
+	return namei_ext_register_target_batch(cgroup_path, &target, 1);
 }
 
 int namei_ext_clear_targets(const char *cgroup_path)

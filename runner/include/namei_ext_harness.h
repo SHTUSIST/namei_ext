@@ -15,6 +15,11 @@ struct namei_ext_harness_policy {
 	bool attached;
 };
 
+struct namei_ext_target_registration {
+	const char *path;
+	uint32_t target_id;
+};
+
 int namei_ext_path_join(char *dst, size_t size, const char *dir,
 			const char *name);
 int namei_ext_write_text(const char *path, const char *value);
@@ -28,6 +33,10 @@ int namei_ext_cgroup_id(const char *path, uint64_t *id_out);
 
 int namei_ext_register_target(const char *cgroup_path,
 			       const char *target_path, uint32_t target_id);
+int namei_ext_register_target_batch(
+	const char *cgroup_path,
+	const struct namei_ext_target_registration *targets,
+	size_t target_count);
 int namei_ext_clear_targets(const char *cgroup_path);
 int namei_ext_policy_parent_exact(const char *cgroup_path,
 				   const char *parent_dir);

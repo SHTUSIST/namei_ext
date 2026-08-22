@@ -92,8 +92,9 @@ mandatory RQ1 case studies W1--W7.
   47 exact logical relative paths to Spindle's existing cache files and passes
   every other path through to a hidden bind of the original test tree. It
   enables the upstream kernel FUSE passthrough API for opened regular files,
-  adds per-callback and per-target counters, and explicitly invalidates the
-  affected entry/inode when permission or withdrawal state changes. It does
+  adds per-callback and per-target counters, and explicitly notifies the kernel
+  about the affected entry and inode when permission or withdrawal state
+  changes. It does
   not populate or transform file data.
 
 ## Comparison
@@ -159,7 +160,21 @@ mandatory RQ1 case studies W1--W7.
   restoration and cleanup. The FUSE arm additionally requires successful
   negotiation of `FUSE_CAP_PASSTHROUGH`, a positive backing ID for every
   regular-file open in the measured window, zero userspace read fallback, and
-  successful entry/inode invalidation acknowledgements for both state changes.
+  zero from every inode notification. Each entry notification must return zero
+  or `-ENOENT`; the kernel reverse-invalidation implementation uses the latter
+  when it cannot find a parent or positive parent/name cache entry. This status
+  is not sufficient by itself. When it occurs, the FUSE arm must successfully
+  issue the mainline connection-epoch notification before continuing; the raw
+  result records both the fallback attempt and its status. A subsequent
+  non-root `fstatat` of the withdrawn pathname must return `ENOENT`, the
+  withdrawn loader must fail with its exact diagnostic, and the backing-object
+  engagement counter must not advance. Any other notification error, failed
+  epoch fallback, or stale pathname observation invalidates the run. The
+  namei_ext arm performs the equivalent
+  transition by replacing the selected-target rule with an explicit `HIDE`
+  rule; deleting the rule would mean `PASS` and expose the lower source file.
+  Its lookup-hide counter must advance while the selected-target hit counter
+  remains unchanged.
 - Repetitions, seeds, and uncertainty: formal run uses 20 fresh modified-kernel
   KVM boots arranged as ten condition pairs, with three warmups and 50 measured
   loader launches in each boot. Odd pairs launch namei_ext then FUSE; even
@@ -214,6 +229,26 @@ mandatory RQ1 case studies W1--W7.
   loader time plus a compact row for daemon CPU, callbacks, and BPF decisions;
   combine it with the Agent macro and FxMark RQ2 evidence rather than creating
   another independent evaluation story.
+
+## Execution-Grounded Amendment
+
+Formal02 and formal03 showed that the low-level entry notification reproducibly
+returns `-ENOENT` while inode notification succeeds. Reordering notifications
+did not change this result. The original exact-zero entry gate was therefore
+checked against the pinned primary source. libfuse 3.18.2
+passes the low-level notification to the kernel and returns its error. Linux
+`fs/fuse/dir.c:fuse_reverse_inval_entry()` returns `-ENOENT` when the parent or
+positive parent/name cache entry is absent. The official low-level API does not
+define `-ENOENT` itself as proof of a completed state transition.
+
+The plan now preserves the raw status and admits only zero or `-ENOENT` for the
+entry notification. It does not infer correctness from that status. Every
+condition and repetition must also contain a non-root permission result, a
+withdrawn-path `fstatat` result of `ENOENT`, an exact withdrawn-loader failure,
+and a no-backing-engagement window. These checks veto the complete run if stale
+lookup state survives or FUSE rejects only at `open`. This is the first plan
+amendment; the workload, primary metric, paired design, sample budget, cache
+configuration, and expected outcomes are unchanged.
 
 ## Reproducibility Notes
 

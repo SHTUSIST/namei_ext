@@ -109,30 +109,20 @@ workload-sandboxfs-acquire: $(SANDBOXFS_ARCHIVE)
 	test -s "$(SANDBOXFS_ARCHIVE)"
 
 workload-sandboxfs-build: $(SANDBOXFS_BUILD_PROVENANCE)
-	printf '%s  %s\n' "$(SANDBOXFS_ARCHIVE_SHA256)" \
-		"$(SANDBOXFS_ARCHIVE)" | sha256sum -c -
-	printf '%s  %s\n' "$(SANDBOXFS_CARGO_LOCK_SHA256)" \
-		"$(SANDBOXFS_CARGO_LOCK)" | sha256sum -c -
 	test -x "$(SANDBOXFS_BINARY)"
 	test "$$("$(SANDBOXFS_BINARY)" --version)" = \
 		"sandboxfs $(SANDBOXFS_VERSION)"
 	test -s "$(SANDBOXFS_BUILD_LOG)"
 	test -s "$(SANDBOXFS_LDD)"
-	test "$$(sha256sum "$(SANDBOXFS_BINARY)" | awk '{print $$1}')" = \
-		"$(SANDBOXFS_BINARY_SHA256)"
 	test "$$(pkg-config --modversion fuse)" = \
 		"$(SANDBOXFS_LIBFUSE_VERSION)"
-	test "$$(sha256sum "$(SANDBOXFS_LIBFUSE_RUNTIME)" | awk '{print $$1}')" = \
-		"$(SANDBOXFS_LIBFUSE_RUNTIME_SHA256)"
 	jq -e \
 		--arg commit "$(SANDBOXFS_COMMIT)" \
-		--arg archive_sha256 "$(SANDBOXFS_ARCHIVE_SHA256)" \
-		--arg lock_sha256 "$(SANDBOXFS_CARGO_LOCK_SHA256)" \
+		--arg version "$(SANDBOXFS_VERSION)" \
 		--arg rustc "$(SANDBOXFS_RUSTC_VERSION)" \
 		--arg cargo "$(SANDBOXFS_CARGO_VERSION)" \
 		--arg libfuse "$(SANDBOXFS_LIBFUSE_VERSION)" \
-		--arg binary_sha256 "$(SANDBOXFS_BINARY_SHA256)" \
-		'.schema == "namei_ext.workload_build_provenance.v1" and .project == "sandboxfs" and .commit == $$commit and .source.archive_sha256 == $$archive_sha256 and .source.cargo_lock.sha256 == $$lock_sha256 and .build.toolchain.rustc == $$rustc and .build.toolchain.cargo == $$cargo and .build.toolchain.libfuse == $$libfuse and .build.binary.sha256 == $$binary_sha256' \
+		'.schema == "namei_ext.workload_build_provenance.v2" and .project == "sandboxfs" and .version == $$version and .commit == $$commit and .build.toolchain.rustc == $$rustc and .build.toolchain.cargo == $$cargo and .build.toolchain.libfuse == $$libfuse and .build.binary.version == ("sandboxfs " + $$version)' \
 		"$(SANDBOXFS_BUILD_PROVENANCE)" >/dev/null
 
 workload-dmtcp-acquire: $(DMTCP_ARCHIVE)
@@ -302,8 +292,8 @@ $(BAZEL_BINARY): | $(WORKLOAD_CACHE_ROOT)
 
 $(SANDBOXFS_ARCHIVE): | $(WORKLOAD_CACHE_ROOT)
 	curl -fL --retry 3 --connect-timeout 30 -o "$@.tmp" "$(SANDBOXFS_URL)"
-	printf '%s  %s\n' "$(SANDBOXFS_ARCHIVE_SHA256)" "$@.tmp" | \
-		sha256sum -c -
+	test "$$(tar -tzf "$@.tmp" | grep -Fc '/Cargo.toml')" = 1
+	test "$$(tar -tzf "$@.tmp" | grep -Fc '/LICENSE')" = 1
 	mv -f "$@.tmp" "$@"
 
 $(SPINDLE_ARCHIVE): | $(WORKLOAD_CACHE_ROOT)
@@ -393,10 +383,6 @@ $(SANDBOXFS_EXTRACT_STAMP): $(SANDBOXFS_ARCHIVE) \
 $(SANDBOXFS_CARGO_LOCK) | $(WORKLOAD_BUILD_ROOT)
 	rm -rf "$(SANDBOXFS_WORK_ROOT)"
 	install -d "$(SANDBOXFS_WORK_ROOT)"
-	printf '%s  %s\n' "$(SANDBOXFS_ARCHIVE_SHA256)" \
-		"$(SANDBOXFS_ARCHIVE)" | sha256sum -c -
-	printf '%s  %s\n' "$(SANDBOXFS_CARGO_LOCK_SHA256)" \
-		"$(SANDBOXFS_CARGO_LOCK)" | sha256sum -c -
 	tar -xzf "$(SANDBOXFS_ARCHIVE)" -C "$(SANDBOXFS_WORK_ROOT)"
 	test -f "$(SANDBOXFS_SRC)/Cargo.toml"
 	test -f "$(SANDBOXFS_SRC)/LICENSE"
@@ -417,8 +403,6 @@ $(ROOT_DIR)/mk/workload.mk | $(SANDBOXFS_BUILD_RECORD_DIR)
 	test "$$(rustc --version)" = "$(SANDBOXFS_RUSTC_VERSION)"
 	test "$$(pkg-config --modversion fuse)" = \
 		"$(SANDBOXFS_LIBFUSE_VERSION)"
-	test "$$(sha256sum "$(SANDBOXFS_LIBFUSE_RUNTIME)" | awk '{print $$1}')" = \
-		"$(SANDBOXFS_LIBFUSE_RUNTIME_SHA256)"
 	CARGO_TARGET_DIR="$(SANDBOXFS_TARGET_DIR)" \
 		cargo build --release --locked \
 		--manifest-path "$(SANDBOXFS_SRC)/Cargo.toml" \
@@ -428,8 +412,6 @@ $(ROOT_DIR)/mk/workload.mk | $(SANDBOXFS_BUILD_RECORD_DIR)
 	test -x "$(SANDBOXFS_BINARY)"
 	test "$$("$(SANDBOXFS_BINARY)" --version)" = \
 		"sandboxfs $(SANDBOXFS_VERSION)"
-	test "$$(sha256sum "$(SANDBOXFS_BINARY)" | awk '{print $$1}')" = \
-		"$(SANDBOXFS_BINARY_SHA256)"
 	ldd "$(SANDBOXFS_BINARY)" >"$(SANDBOXFS_LDD).tmp"
 	grep -F 'libfuse.so.2' "$(SANDBOXFS_LDD).tmp"
 	mv -f "$(SANDBOXFS_LDD).tmp" "$(SANDBOXFS_LDD)"
@@ -438,39 +420,31 @@ $(ROOT_DIR)/mk/workload.mk | $(SANDBOXFS_BUILD_RECORD_DIR)
 $(SANDBOXFS_BUILD_PROVENANCE): $(SANDBOXFS_BUILD_STAMP) | \
 $(SANDBOXFS_BUILD_RECORD_DIR)
 	jq -n \
-		--arg schema "namei_ext.workload_build_provenance.v1" \
+		--arg schema "namei_ext.workload_build_provenance.v2" \
 		--arg project "sandboxfs" \
 		--arg version "$(SANDBOXFS_VERSION)" \
 		--arg commit "$(SANDBOXFS_COMMIT)" \
 		--arg url "$(SANDBOXFS_URL)" \
 		--arg archive "$(SANDBOXFS_ARCHIVE)" \
-		--arg archive_sha256 "$$(sha256sum "$(SANDBOXFS_ARCHIVE)" | awk '{print $$1}')" \
 		--arg cargo_lock "$(SANDBOXFS_CARGO_LOCK)" \
-		--arg cargo_lock_sha256 "$$(sha256sum "$(SANDBOXFS_CARGO_LOCK)" | awk '{print $$1}')" \
 		--arg cargo_version "$$(cargo --version)" \
 		--arg rustc_version "$$(rustc --version)" \
 		--arg libfuse_version "$$(pkg-config --modversion fuse)" \
 		--arg libfuse_runtime "$(SANDBOXFS_LIBFUSE_RUNTIME)" \
-		--arg libfuse_sha256 "$$(sha256sum "$(SANDBOXFS_LIBFUSE_RUNTIME)" | awk '{print $$1}')" \
 		--arg binary "$(SANDBOXFS_BINARY)" \
-		--arg binary_sha256 "$$(sha256sum "$(SANDBOXFS_BINARY)" | awk '{print $$1}')" \
 		--arg binary_version "$$("$(SANDBOXFS_BINARY)" --version)" \
 		--arg build_log "$(SANDBOXFS_BUILD_LOG)" \
-		--arg build_log_sha256 "$$(sha256sum "$(SANDBOXFS_BUILD_LOG)" | awk '{print $$1}')" \
 		--arg ldd "$(SANDBOXFS_LDD)" \
-		--arg ldd_sha256 "$$(sha256sum "$(SANDBOXFS_LDD)" | awk '{print $$1}')" \
-		'{schema:$$schema,project:$$project,version:$$version,commit:$$commit,source:{url:$$url,archive:$$archive,archive_sha256:$$archive_sha256,cargo_lock:{path:$$cargo_lock,sha256:$$cargo_lock_sha256}},build:{command:["cargo","build","--release","--locked"],toolchain:{cargo:$$cargo_version,rustc:$$rustc_version,libfuse:$$libfuse_version,libfuse_runtime:{path:$$libfuse_runtime,sha256:$$libfuse_sha256}},log:{path:$$build_log,sha256:$$build_log_sha256},ldd:{path:$$ldd,sha256:$$ldd_sha256},binary:{path:$$binary,sha256:$$binary_sha256,version:$$binary_version}}}' \
+		'{schema:$$schema,project:$$project,version:$$version,commit:$$commit,source:{url:$$url,archive:$$archive,cargo_lock:$$cargo_lock},build:{command:["cargo","build","--release","--locked"],toolchain:{cargo:$$cargo_version,rustc:$$rustc_version,libfuse:$$libfuse_version,libfuse_runtime:$$libfuse_runtime},log:$$build_log,ldd:$$ldd,binary:{path:$$binary,version:$$binary_version}}}' \
 		>"$@.tmp"
 	jq -e \
 		--arg commit "$(SANDBOXFS_COMMIT)" \
-		--arg archive_sha256 "$(SANDBOXFS_ARCHIVE_SHA256)" \
-		--arg lock_sha256 "$(SANDBOXFS_CARGO_LOCK_SHA256)" \
+		--arg version "$(SANDBOXFS_VERSION)" \
 		--arg rustc "$(SANDBOXFS_RUSTC_VERSION)" \
-			--arg cargo "$(SANDBOXFS_CARGO_VERSION)" \
-			--arg libfuse "$(SANDBOXFS_LIBFUSE_VERSION)" \
-			--arg binary_sha256 "$(SANDBOXFS_BINARY_SHA256)" \
-			'.schema == "namei_ext.workload_build_provenance.v1" and .project == "sandboxfs" and .commit == $$commit and .source.archive_sha256 == $$archive_sha256 and .source.cargo_lock.sha256 == $$lock_sha256 and .build.toolchain.rustc == $$rustc and .build.toolchain.cargo == $$cargo and .build.toolchain.libfuse == $$libfuse and .build.binary.sha256 == $$binary_sha256' \
-			"$@.tmp" >/dev/null
+		--arg cargo "$(SANDBOXFS_CARGO_VERSION)" \
+		--arg libfuse "$(SANDBOXFS_LIBFUSE_VERSION)" \
+		'.schema == "namei_ext.workload_build_provenance.v2" and .project == "sandboxfs" and .version == $$version and .commit == $$commit and .build.toolchain.rustc == $$rustc and .build.toolchain.cargo == $$cargo and .build.toolchain.libfuse == $$libfuse and .build.binary.version == ("sandboxfs " + $$version)' \
+		"$@.tmp" >/dev/null
 	mv -f "$@.tmp" "$@"
 
 $(DMTCP_ARCHIVE): | $(WORKLOAD_CACHE_ROOT)

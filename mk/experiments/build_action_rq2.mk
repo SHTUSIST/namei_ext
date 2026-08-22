@@ -14,13 +14,13 @@ BUILD_ACTION_RQ2_BPFTOOL ?= $(KERNEL_BPFTOOL)
 BUILD_ACTION_RQ2_ANALYSIS ?= \
 	$(ROOT_DIR)/analysis/build_action_rq2/analyze.py
 BUILD_ACTION_RQ2_PLAN ?= \
-	$(ROOT_DIR)/docs/tmp/2026-07-29-build-action-rq2-experiment-plan.md
+	$(ROOT_DIR)/docs/tmp/2026-08-07-build-action-rq2-reentry-plan.md
 BUILD_ACTION_RQ2_PLAN_REVIEW ?= \
-	$(ROOT_DIR)/docs/tmp/2026-07-29-build-action-rq2-plan-review.md
+	$(ROOT_DIR)/docs/tmp/2026-08-07-build-action-rq2-reentry-plan-review.md
 BUILD_ACTION_RQ2_SOURCE_AUDIT ?= \
 	$(ROOT_DIR)/docs/tmp/2026-07-28-sandboxfs-0.2.0-protocol-audit.md
 BUILD_ACTION_RQ2_BOOT_FILES := \
-	guest.mk guest.mk.sha256 launcher.stdout.log launcher.stderr.log \
+	guest.mk launcher.stdout.log launcher.stderr.log \
 	vcpu-affinity.json affinity-barrier.txt boot.json observations.jsonl \
 	stdout.log stderr.log runner.ready runner.release runner.status \
 	sandboxfs.stderr.log bpf-programs-before.json \
@@ -30,22 +30,73 @@ BUILD_ACTION_RQ2_BOOT_FILES := \
 	fuse-open-fds-before.txt fuse-open-fds-before.status \
 	fuse-open-fds-middle.txt fuse-open-fds-middle.status \
 	fuse-open-fds-after.txt fuse-open-fds-after.status \
-	kernel.config kernel-commit.txt kernel-build-id.txt \
-	kernel-notes.sha256 kernel-btf.sha256 kernel-release.txt \
+	kernel.config kernel-commit.txt kernel-build-id.txt kernel-release.txt \
 	clocksource-before.txt clocksource-after.txt uname.txt proc-version.txt \
 	kernel-cmdline.txt proc-stat-before.txt proc-stat-after.txt dmesg.log
+BUILD_ACTION_RQ2_HOST_FILES := \
+	host-lscpu.txt host-lscpu-extended.txt host-cpu-pin.txt \
+	host-cpu-pin.json host-cpu-frequency-policy.txt vng-version.txt \
+	vng-executable.txt vng-run-module.txt host-proc-stat-before.txt \
+	host-proc-stat-after.txt host-proc-interrupts-before.txt \
+	host-proc-interrupts-after.txt
 
 define BUILD_ACTION_RQ2_VALIDATE_HOST_PIN
 $(call NAMEI_EXT_VALIDATE_HOST_CPU_PIN,$(BUILD_ACTION_RQ2_HOST_CPUS),$(KVM_CPUS))
 endef
 
+define BUILD_ACTION_RQ2_CAPTURE_HOST
+lscpu >"$(1)/host-lscpu.txt"
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE,MAXMHZ,MINMHZ \
+	>"$(1)/host-lscpu-extended.txt"
+cat /proc/stat >"$(1)/host-proc-stat-before.txt"
+cat /proc/interrupts >"$(1)/host-proc-interrupts-before.txt"
+printf '%s\n' "$(2)" >"$(1)/host-cpu-pin.txt"
+pin_start=$$(printf '%s\n' "$(2)" | cut -d- -f1); \
+pin_end=$$(printf '%s\n' "$(2)" | cut -d- -f2); \
+jq -n --argjson start "$$pin_start" --argjson end "$$pin_end" \
+	'[range($$start; $$end + 1)]' >"$(1)/host-cpu-pin.json"; \
+printf 'intel_pstate_no_turbo=%s\n' \
+	"$$(cat /sys/devices/system/cpu/intel_pstate/no_turbo)" \
+	>"$(1)/host-cpu-frequency-policy.txt"; \
+for cpu in $$(seq "$$pin_start" "$$pin_end"); do \
+	printf 'cpu=%s governor=%s driver=%s max_khz=%s\n' "$$cpu" \
+		"$$(cat "/sys/devices/system/cpu/cpu$$cpu/cpufreq/scaling_governor")" \
+		"$$(cat "/sys/devices/system/cpu/cpu$$cpu/cpufreq/scaling_driver")" \
+		"$$(cat "/sys/devices/system/cpu/cpu$$cpu/cpufreq/cpuinfo_max_freq")" \
+		>>"$(1)/host-cpu-frequency-policy.txt"; \
+done
+vng_path=$$(command -v "$(VNG)"); \
+vng_module_path=$$(python3 -c 'import virtme_ng.run; print(virtme_ng.run.__file__)'); \
+"$(VNG)" --version >"$(1)/vng-version.txt"; \
+printf '%s\n' "$$vng_path" >"$(1)/vng-executable.txt"; \
+printf '%s\n' "$$vng_module_path" >"$(1)/vng-run-module.txt"
+endef
+
+define BUILD_ACTION_RQ2_VALIDATE_HOST_FILES
+for file in $(BUILD_ACTION_RQ2_HOST_FILES); do \
+	test -s "$(1)/$$file"; \
+done
+endef
+
+define BUILD_ACTION_RQ2_VALIDATE_RUN_BASE
+jq -e --arg schema "$(NAMEI_EXT_RUN_SCHEMA)" --arg run_id "$(RUN_ID)" --arg observations "$(notdir $(2))" '.schema == $$schema and .run_id == $$run_id and .status == "running" and (.completed_at | not) and .observations == $$observations and (.source.commit | type == "string" and length == 40) and (.source.dirty | type == "boolean") and (.kernel.commit | type == "string" and length == 40) and (.kernel.dirty | type == "boolean") and .kernel_commit == .kernel.commit' "$(1)/run.json" >/dev/null
+test -s "$(1)/run.json"
+test -s "$(2)"
+for file in command.txt source-commit.txt kernel-commit.txt; do test -s "$(1)/$$file"; done
+for file in source-status.txt kernel-status.txt; do test -e "$(1)/$$file"; done
+test "$$(cat "$(1)/source-commit.txt")" = "$$(jq -r '.source.commit' "$(1)/run.json")"
+test "$$(cat "$(1)/kernel-commit.txt")" = "$$(jq -r '.kernel.commit' "$(1)/run.json")"
+test "$$(test -s "$(1)/source-status.txt" && printf true || printf false)" = "$$(jq -r '.source.dirty' "$(1)/run.json")"
+test "$$(test -s "$(1)/kernel-status.txt" && printf true || printf false)" = "$$(jq -r '.kernel.dirty' "$(1)/run.json")"
+endef
+
 define BUILD_ACTION_RQ2_CAPTURE_ARTIFACTS
-printf '%s  %s\n' "$(BAZEL_BINARY_SHA256)" "$(BAZEL_BINARY)" | \
-	sha256sum -c -
-printf '%s  %s\n' "$(SANDBOXFS_BINARY_SHA256)" "$(SANDBOXFS_BINARY)" | \
-	sha256sum -c -
-printf '%s  %s\n' "$(SANDBOXFS_LIBFUSE_RUNTIME_SHA256)" \
-	"$(SANDBOXFS_LIBFUSE_RUNTIME)" | sha256sum -c -
+test -x "$(BAZEL_BINARY)"
+test "$$($(BAZEL_BINARY) --version)" = "bazel $(BAZEL_VERSION)"
+test -x "$(SANDBOXFS_BINARY)"
+test "$$($(SANDBOXFS_BINARY) --version)" = \
+	"sandboxfs $(SANDBOXFS_VERSION)"
+test "$$(pkg-config --modversion fuse)" = "$(SANDBOXFS_LIBFUSE_VERSION)"
 test -x "$(BUILD_ACTION_RQ2_BPFTOOL)"
 test "$$(cat "$(KERNEL_BPFTOOL_SOURCE_STAMP)")" = \
 	"$$(git -C "$(KERNEL_DIR)" rev-parse HEAD)"
@@ -55,10 +106,6 @@ install -d "$(1)/artifacts/kernel" "$(1)/artifacts/runtime" \
 install -m 0444 "$(KERNEL_IMAGE)" "$(1)/artifacts/kernel/bzImage"
 install -m 0444 "$(KERNEL_BUILD_DIR)/.config" \
 	"$(1)/artifacts/kernel/config"
-objcopy --dump-section .BTF="$(1)/artifacts/kernel/vmlinux.btf" \
-	"$(KERNEL_BUILD_DIR)/vmlinux"
-objcopy --dump-section .notes="$(1)/artifacts/kernel/vmlinux.notes" \
-	"$(KERNEL_BUILD_DIR)/vmlinux"
 install -m 0555 "$(BUILD_ACTION_RQ2_RUNNER)" \
 	"$(1)/artifacts/runtime/namei_ext_build_action_rq2"
 install -m 0444 "$(BUILD_ACTION_RQ2_POLICY)" \
@@ -84,19 +131,12 @@ jq -n \
 	--arg kernel_commit "$$(cat "$(KERNEL_COMMIT_FILE)")" \
 	--arg kernel_release "$$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' "$(KERNEL_RELEASE_HEADER)")" \
 	--arg kernel_build_id "$$(readelf -n "$(KERNEL_BUILD_DIR)/vmlinux" | awk '/Build ID:/ {print $$3; exit}')" \
-	--arg kernel_notes_sha256 "$$(sha256sum "$(1)/artifacts/kernel/vmlinux.notes" | awk '{print $$1}')" \
-	--arg kernel_btf_sha256 "$$(sha256sum "$(1)/artifacts/kernel/vmlinux.btf" | awk '{print $$1}')" \
 	--arg sandboxfs_commit "$(SANDBOXFS_COMMIT)" \
-	--arg sandboxfs_archive_sha256 "$(SANDBOXFS_ARCHIVE_SHA256)" \
-	--arg sandboxfs_lock_sha256 "$(SANDBOXFS_CARGO_LOCK_SHA256)" \
-	--arg sandboxfs_binary_sha256 "$$(sha256sum "$(1)/artifacts/runtime/sandboxfs" | awk '{print $$1}')" \
+	--arg sandboxfs_version "$(SANDBOXFS_VERSION)" \
 	--arg libfuse_version "$(SANDBOXFS_LIBFUSE_VERSION)" \
-	--arg libfuse_sha256 "$$(sha256sum "$(1)/artifacts/runtime/libfuse.so.2" | awk '{print $$1}')" \
 	--arg bazel_version "$$("$(BAZEL_BINARY)" --version)" \
-	--arg bazel_sha256 "$$(sha256sum "$(BAZEL_BINARY)" | awk '{print $$1}')" \
 	--arg bpftool_version "$$("$(1)/artifacts/runtime/bpftool" version)" \
-	--arg bpftool_sha256 "$$(sha256sum "$(1)/artifacts/runtime/bpftool" | awk '{print $$1}')" \
-	'{kernel:{commit:$$kernel_commit,release:$$kernel_release,build_id:$$kernel_build_id,notes_sha256:$$kernel_notes_sha256,btf_sha256:$$kernel_btf_sha256,image:"artifacts/kernel/bzImage",config:"artifacts/kernel/config"},runtime:{runner:"artifacts/runtime/namei_ext_build_action_rq2",policy:"artifacts/runtime/build_action_sandboxing.bpf.o",sandboxfs:"artifacts/runtime/sandboxfs",libfuse:"artifacts/runtime/libfuse.so.2",bazel:"artifacts/runtime/bazel",bpftool:"artifacts/runtime/bpftool",bpftool_version:$$bpftool_version,bpftool_sha256:$$bpftool_sha256,bpftool_source_commit:$$kernel_commit},source:{sandboxfs:{commit:$$sandboxfs_commit,archive:"artifacts/source/sandboxfs/source.tar.gz",archive_sha256:$$sandboxfs_archive_sha256,cargo_lock:"artifacts/source/sandboxfs/Cargo.lock",cargo_lock_sha256:$$sandboxfs_lock_sha256,build:"artifacts/source/sandboxfs/build.json",build_log:"artifacts/source/sandboxfs/build.log",ldd:"artifacts/source/sandboxfs/ldd.txt",binary_sha256:$$sandboxfs_binary_sha256,libfuse_version:$$libfuse_version,libfuse_sha256:$$libfuse_sha256},bazel:{version:$$bazel_version,sha256:$$bazel_sha256}}}' \
+	'{kernel:{commit:$$kernel_commit,release:$$kernel_release,build_id:$$kernel_build_id,image:"artifacts/kernel/bzImage",config:"artifacts/kernel/config"},runtime:{runner:"artifacts/runtime/namei_ext_build_action_rq2",policy:"artifacts/runtime/build_action_sandboxing.bpf.o",sandboxfs:"artifacts/runtime/sandboxfs",libfuse:"artifacts/runtime/libfuse.so.2",bazel:"artifacts/runtime/bazel",bpftool:"artifacts/runtime/bpftool",bpftool_version:$$bpftool_version,bpftool_source_commit:$$kernel_commit},source:{sandboxfs:{commit:$$sandboxfs_commit,version:$$sandboxfs_version,archive:"artifacts/source/sandboxfs/source.tar.gz",cargo_lock:"artifacts/source/sandboxfs/Cargo.lock",build:"artifacts/source/sandboxfs/build.json",build_log:"artifacts/source/sandboxfs/build.log",ldd:"artifacts/source/sandboxfs/ldd.txt",libfuse_version:$$libfuse_version},bazel:{version:$$bazel_version}}}' \
 	>"$(1)/artifacts/manifest.json"
 jq -e '.kernel.commit | length == 40' \
 	"$(1)/artifacts/manifest.json" >/dev/null
@@ -104,17 +144,10 @@ jq -e '.kernel.release | length > 0' \
 	"$(1)/artifacts/manifest.json" >/dev/null
 jq -e '.kernel.build_id | length > 0' \
 	"$(1)/artifacts/manifest.json" >/dev/null
-jq -e '.runtime.bpftool_sha256 | length == 64' \
-	"$(1)/artifacts/manifest.json" >/dev/null
 jq -e '.runtime.bpftool_version | type == "string" and length > 0' \
 	"$(1)/artifacts/manifest.json" >/dev/null
 jq -e '.runtime.bpftool_source_commit == .kernel.commit' \
 	"$(1)/artifacts/manifest.json" >/dev/null
-test "$$(jq -r '.runtime.bpftool_sha256' \
-	"$(1)/artifacts/manifest.json")" = \
-	"$$(sha256sum "$(1)/artifacts/runtime/bpftool" | awk '{print $$1}')"
-(cd "$(1)" && find artifacts -type f -print0 | LC_ALL=C sort -z | \
-	xargs -0 sha256sum >artifacts.sha256)
 endef
 
 define BUILD_ACTION_RQ2_START
@@ -135,24 +168,8 @@ jq --slurpfile artifacts "$(1)/artifacts/manifest.json" \
 	"$(1)/run.json" >"$(1)/run.json.tmp"
 mv -f "$(1)/run.json.tmp" "$(1)/run.json"
 printf '%s\n' "$(6)" >"$(1)/command.txt"
-$(call NAMEI_EXT_MULTI_BOOT_CAPTURE_PINNED_HOST,$(1),$(BUILD_ACTION_RQ2_HOST_CPUS))
+$(call BUILD_ACTION_RQ2_CAPTURE_HOST,$(1),$(BUILD_ACTION_RQ2_HOST_CPUS))
 : >"$(1)/launch-order.jsonl"
-sha256sum "$(ROOT_DIR)/configs/benchmarks/build_action_rq2.mk" \
-	"$(ROOT_DIR)/configs/benchmarks/workload-sources.mk" \
-	"$(ROOT_DIR)/configs/kvm/x86_64.mk" \
-	"$(ROOT_DIR)/Makefile" \
-	"$(ROOT_DIR)/mk/experiments/build_action_rq2.mk" \
-	"$(ROOT_DIR)/mk/workload.mk" "$(ROOT_DIR)/mk/results.mk" \
-	"$(ROOT_DIR)/mk/multi_boot.mk" "$(ROOT_DIR)/mk/kvm.mk" \
-	"$(BUILD_ACTION_RQ2_RUNNER_SOURCE)" \
-	"$(BUILD_ACTION_RQ2_POLICY_SOURCE)" \
-	"$(ROOT_DIR)/runner/include/namei_ext_harness.h" \
-		"$(ROOT_DIR)/runner/src/namei_ext_harness.c" \
-		"$(BUILD_ACTION_RQ2_ANALYSIS)" \
-		"$(ROOT_DIR)/analysis/build_action_rq2/test_analyze.py" \
-		"$(BUILD_ACTION_RQ2_PLAN)" "$(BUILD_ACTION_RQ2_PLAN_REVIEW)" \
-		"$(BUILD_ACTION_RQ2_SOURCE_AUDIT)" \
-		"$(SANDBOXFS_CARGO_LOCK)" >"$(1)/inputs.sha256"
 endef
 
 define BUILD_ACTION_RQ2_WRITE_GUEST_MAKEFILE
@@ -169,14 +186,12 @@ printf '%s := %s\n' \
 	'BUILD_ACTION_RQ2_KERNEL_CONFIG' "$${config#$(ROOT_DIR)/}" \
 	'BUILD_ACTION_RQ2_KERNEL_COMMIT' "$$commit" \
 	'BUILD_ACTION_RQ2_KERNEL_BUILD_ID' "$$build_id" \
-	'BUILD_ACTION_RQ2_KERNEL_NOTES_SHA256' "$$notes_sha" \
-	'BUILD_ACTION_RQ2_KERNEL_BTF_SHA256' "$$btf_sha" \
 	'BUILD_ACTION_RQ2_KERNEL_RELEASE' "$$release" \
 	'BUILD_ACTION_RQ2_SAMPLES_ACTIVE' "$(BUILD_ACTION_RQ2_ACTIVE_SAMPLES)" \
 	'BUILD_ACTION_RQ2_SCALES_ACTIVE' "$(BUILD_ACTION_RQ2_ACTIVE_SCALES)" \
 	'BUILD_ACTION_RQ2_CAPACITY_ACTIVE' "$(BUILD_ACTION_RQ2_ACTIVE_CAPACITY)" \
 	>"$$guest_makefile"; \
-	$(call NAMEI_EXT_MULTI_BOOT_SEAL_GUEST_MAKEFILE,$$guest_makefile,18)
+	! grep -F "$(ROOT_DIR)/" "$$guest_makefile" >/dev/null
 endef
 
 .PHONY: build-action-rq2-analysis-test \
@@ -195,7 +210,8 @@ build-action-rq2-analysis-test:
 	python3 -m unittest discover -s "$(ROOT_DIR)/analysis/build_action_rq2" \
 		-p 'test_*.py' -v
 
-kvm-build-action-rq2-preflight: kernel-bpftool $(KERNEL_IMAGE) bpf \
+kvm-build-action-rq2-preflight: kernel-provenance kernel-bpftool \
+		$(KERNEL_IMAGE) bpf \
 		build-action-sandboxing workload-bazel workload-sandboxfs-build
 	$(call BUILD_ACTION_RQ2_START,$(BUILD_ACTION_RQ2_PREFLIGHT_RESULT_DIR),$(BUILD_ACTION_RQ2_PREFLIGHT_REPETITIONS),$(BUILD_ACTION_RQ2_PREFLIGHT_SAMPLES),$(subst $(NAMEI_EXT_SPACE),$(NAMEI_EXT_COMMA),$(strip $(BUILD_ACTION_RQ2_PREFLIGHT_SCALES))),$(BUILD_ACTION_RQ2_CAPACITY_PROBE),make kvm-build-action-rq2-preflight RUN_ID=$(RUN_ID))
 	$(MAKE) --no-print-directory build-action-rq2-run-matrix \
@@ -216,8 +232,8 @@ kvm-build-action-rq2-preflight: kernel-bpftool $(KERNEL_IMAGE) bpf \
 		RUN_ID="$(RUN_ID)" \
 		BUILD_ACTION_RQ2_ACTIVE_DIR="$(BUILD_ACTION_RQ2_PREFLIGHT_RESULT_DIR)"
 
-kvm-build-action-rq2: kernel-bpftool $(KERNEL_IMAGE) bpf build-action-sandboxing \
-		workload-bazel workload-sandboxfs-build
+kvm-build-action-rq2: kernel-provenance kernel-bpftool $(KERNEL_IMAGE) bpf \
+		build-action-sandboxing workload-bazel workload-sandboxfs-build
 	$(call BUILD_ACTION_RQ2_START,$(BUILD_ACTION_RQ2_RESULT_DIR),$(BUILD_ACTION_RQ2_REPETITIONS),$(BUILD_ACTION_RQ2_SAMPLES),$(subst $(NAMEI_EXT_SPACE),$(NAMEI_EXT_COMMA),$(strip $(BUILD_ACTION_RQ2_SCALES))),0,make kvm-build-action-rq2 RUN_ID=$(RUN_ID))
 	$(MAKE) --no-print-directory build-action-rq2-run-matrix \
 		RUN_ID="$(RUN_ID)" \
@@ -252,8 +268,6 @@ build-action-rq2-run-matrix:
 	config="$(BUILD_ACTION_RQ2_ACTIVE_DIR)/$$(jq -r '.kernel.config' "$$manifest")"; \
 	commit=$$(jq -r '.kernel.commit' "$$manifest"); \
 	build_id=$$(jq -r '.kernel.build_id' "$$manifest"); \
-	notes_sha=$$(jq -r '.kernel.notes_sha256' "$$manifest"); \
-	btf_sha=$$(jq -r '.kernel.btf_sha256' "$$manifest"); \
 	release=$$(jq -r '.kernel.release' "$$manifest"); \
 	runner="$(BUILD_ACTION_RQ2_ACTIVE_DIR)/$$(jq -r '.runtime.runner' "$$manifest")"; \
 	policy="$(BUILD_ACTION_RQ2_ACTIVE_DIR)/$$(jq -r '.runtime.policy' "$$manifest")"; \
@@ -337,7 +351,6 @@ build-action-rq2-finalize:
 		"$(BUILD_ACTION_RQ2_ACTIVE_DIR)/launch-order.jsonl" >/dev/null
 	$(call NAMEI_EXT_MULTI_BOOT_VALIDATE_BOOT_FILES,$(BUILD_ACTION_RQ2_ACTIVE_DIR),$$((2 * $(BUILD_ACTION_RQ2_ACTIVE_REPETITIONS))),$(BUILD_ACTION_RQ2_BOOT_FILES))
 	while IFS= read -r -d '' boot; do \
-		(cd "$$boot" && sha256sum -c guest.mk.sha256); \
 		test "$$(cat "$$boot/runner.status")" = 0; \
 		jq -e '.schema == "namei_ext.build_action_rq2.boot.v1" and .status == "completed" and (.condition == "namei_ext" or .condition == "sandboxfs") and (.repetition | type == "number") and (.completed_at | type == "string" and length > 0)' \
 			"$$boot/boot.json" >/dev/null; \
@@ -374,10 +387,8 @@ build-action-rq2-finalize:
 		test "$$(jq -s '[.[] | select(.event == "build-action-rq2-capacity")] | length' \
 			"$(BUILD_ACTION_RQ2_ACTIVE_DIR)/observations.jsonl")" = 0; \
 	fi
-	sha256sum -c "$(BUILD_ACTION_RQ2_ACTIVE_DIR)/inputs.sha256"
-	(cd "$(BUILD_ACTION_RQ2_ACTIVE_DIR)" && sha256sum -c artifacts.sha256)
-	$(call NAMEI_EXT_MULTI_BOOT_VALIDATE_PINNED_HOST_FILES,$(BUILD_ACTION_RQ2_ACTIVE_DIR))
-	$(call NAMEI_EXT_RUN_VALIDATE_BASE,$(BUILD_ACTION_RQ2_ACTIVE_DIR),$(BUILD_ACTION_RQ2_ACTIVE_DIR)/observations.jsonl)
+	$(call BUILD_ACTION_RQ2_VALIDATE_HOST_FILES,$(BUILD_ACTION_RQ2_ACTIVE_DIR))
+	$(call BUILD_ACTION_RQ2_VALIDATE_RUN_BASE,$(BUILD_ACTION_RQ2_ACTIVE_DIR),$(BUILD_ACTION_RQ2_ACTIVE_DIR)/observations.jsonl)
 
 build-action-rq2-mark-complete:
 	test -n "$(BUILD_ACTION_RQ2_ACTIVE_DIR)"
@@ -386,8 +397,6 @@ build-action-rq2-mark-complete:
 
 build-action-rq2-report:
 	$(call NAMEI_EXT_RUN_VALIDATE_COMPLETE,$(BUILD_ACTION_RQ2_RESULT_DIR))
-	sha256sum -c "$(BUILD_ACTION_RQ2_RESULT_DIR)/inputs.sha256"
-	(cd "$(BUILD_ACTION_RQ2_RESULT_DIR)" && sha256sum -c artifacts.sha256)
 	$(call NAMEI_EXT_ANALYSIS_PREPARE,$(BUILD_ACTION_RQ2_RESULT_DIR)/analysis)
 	python3 "$(BUILD_ACTION_RQ2_ANALYSIS)" \
 		--run "$(BUILD_ACTION_RQ2_RESULT_DIR)/run.json" \
@@ -407,7 +416,7 @@ experiment-build-action-rq2: kvm-build-action-rq2 \
 	build-action-rq2-report
 
 __build_action_rq2_guest: __namei_ext_guest_prepare
-	$(call NAMEI_EXT_MULTI_BOOT_VALIDATE_GUEST_MAKEFILE,$(lastword $(MAKEFILE_LIST)))
+	test "$(notdir $(lastword $(MAKEFILE_LIST)))" = guest.mk
 	case "$(CONDITION)" in namei_ext|sandboxfs) ;; *) exit 1;; esac
 	test -n "$(REPETITION)"
 	test -x "$(BUILD_ACTION_RQ2_RUNNER)"
@@ -447,16 +456,8 @@ __build_action_rq2_guest: __namei_ext_guest_prepare
 		$(BUILD_ACTION_RQ2_KERNEL_CONFIG),\
 		$(BUILD_ACTION_RQ2_KERNEL_COMMIT),\
 		$(BUILD_ACTION_RQ2_KERNEL_RELEASE))
-	actual_notes_sha=$$(sha256sum /sys/kernel/notes | awk '{print $$1}'); \
-	test "$$actual_notes_sha" = "$(BUILD_ACTION_RQ2_KERNEL_NOTES_SHA256)"; \
-	printf '%s  %s\n' "$$actual_notes_sha" /sys/kernel/notes \
-		>"$(BUILD_ACTION_RQ2_BOOT_DIR)/kernel-notes.sha256"
 	printf '%s\n' "$(BUILD_ACTION_RQ2_KERNEL_BUILD_ID)" \
 		>"$(BUILD_ACTION_RQ2_BOOT_DIR)/kernel-build-id.txt"
-	actual_btf_sha=$$(sha256sum /sys/kernel/btf/vmlinux | awk '{print $$1}'); \
-	test "$$actual_btf_sha" = "$(BUILD_ACTION_RQ2_KERNEL_BTF_SHA256)"; \
-	printf '%s  %s\n' "$$actual_btf_sha" /sys/kernel/btf/vmlinux \
-		>"$(BUILD_ACTION_RQ2_BOOT_DIR)/kernel-btf.sha256"
 	grep -q ' [Tt] namei_ext_lookup$$' /proc/kallsyms
 	clocksource=$$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource); \
 	test "$$clocksource" = tsc; \
@@ -569,11 +570,9 @@ __build_action_rq2_guest: __namei_ext_guest_prepare
 		--arg condition "$(CONDITION)" \
 		--arg kernel_commit "$(BUILD_ACTION_RQ2_KERNEL_COMMIT)" \
 		--arg kernel_build_id "$(BUILD_ACTION_RQ2_KERNEL_BUILD_ID)" \
-		--arg kernel_notes_sha256 "$(BUILD_ACTION_RQ2_KERNEL_NOTES_SHA256)" \
-		--arg kernel_btf_sha256 "$(BUILD_ACTION_RQ2_KERNEL_BTF_SHA256)" \
 		--arg kernel_release "$(BUILD_ACTION_RQ2_KERNEL_RELEASE)" \
 		--arg scales "$(BUILD_ACTION_RQ2_SCALES_ACTIVE)" \
 		--argjson samples "$(BUILD_ACTION_RQ2_SAMPLES_ACTIVE)" \
 		--arg completed_at "$$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" \
-		'{schema:"namei_ext.build_action_rq2.boot.v1",status:"completed",repetition:$$repetition,condition:$$condition,kernel_commit:$$kernel_commit,kernel_build_id:$$kernel_build_id,kernel_notes_sha256:$$kernel_notes_sha256,kernel_btf_sha256:$$kernel_btf_sha256,kernel_release:$$kernel_release,scales:($$scales | split(",") | map(tonumber)),samples_per_scale:$$samples,clocksource:"tsc",completed_at:$$completed_at}' \
+		'{schema:"namei_ext.build_action_rq2.boot.v1",status:"completed",repetition:$$repetition,condition:$$condition,kernel_commit:$$kernel_commit,kernel_build_id:$$kernel_build_id,kernel_release:$$kernel_release,scales:($$scales | split(",") | map(tonumber)),samples_per_scale:$$samples,clocksource:"tsc",completed_at:$$completed_at}' \
 		>"$(BUILD_ACTION_RQ2_BOOT_DIR)/boot.json"

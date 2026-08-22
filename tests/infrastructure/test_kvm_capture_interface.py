@@ -273,18 +273,19 @@ class KvmCaptureInterfaceTest(unittest.TestCase):
             config,
             r"SANDBOXFS_COMMIT \?= [0-9a-f]{40}",
         )
-        self.assertRegex(
-            config,
-            r"SANDBOXFS_ARCHIVE_SHA256 \?= [0-9a-f]{64}",
+        self.assertNotIn("SANDBOXFS_ARCHIVE_SHA256", config)
+        self.assertNotIn("SANDBOXFS_CARGO_LOCK_SHA256", config)
+        self.assertNotIn("SANDBOXFS_BINARY_SHA256", config)
+        self.assertNotIn("SANDBOXFS_ARCHIVE_SHA256", workload)
+        self.assertNotIn("SANDBOXFS_CARGO_LOCK_SHA256", workload)
+        self.assertNotIn("SANDBOXFS_BINARY_SHA256", workload)
+        self.assertNotIn("sha256", suite.lower())
+        self.assertNotIn(
+            "NAMEI_EXT_MULTI_BOOT_CAPTURE_PINNED_HOST,", suite
         )
-        self.assertRegex(
-            config,
-            r"SANDBOXFS_CARGO_LOCK_SHA256 \?= [0-9a-f]{64}",
-        )
-        self.assertRegex(
-            config,
-            r"SANDBOXFS_BINARY_SHA256 \?= [0-9a-f]{64}",
-        )
+        self.assertNotIn("NAMEI_EXT_RUN_VALIDATE_BASE", suite)
+        self.assertIn("BUILD_ACTION_RQ2_CAPTURE_HOST", suite)
+        self.assertIn("BUILD_ACTION_RQ2_VALIDATE_RUN_BASE", suite)
         self.assertIn(
             "thirdparty/locks/sandboxfs-0.2.0.Cargo.lock",
             config,
@@ -318,8 +319,13 @@ class KvmCaptureInterfaceTest(unittest.TestCase):
             suite,
         )
         self.assertIn(
-            "kvm-build-action-rq2-preflight: kernel-bpftool",
-            suite,
+            "kvm-build-action-rq2-preflight: kernel-provenance "
+            "kernel-bpftool",
+            normalized_suite,
+        )
+        self.assertIn(
+            "kvm-build-action-rq2: kernel-provenance kernel-bpftool",
+            normalized_suite,
         )
         self.assertNotIn(
             "BUILD_ACTION_RQ2_BPFTOOL ?= /usr/local/sbin/bpftool",
@@ -337,6 +343,16 @@ class KvmCaptureInterfaceTest(unittest.TestCase):
         )
         self.assertEqual(runner.count("\"printf '%%s' '%s' > '%s'; \""), 2)
         self.assertEqual(runner.count("\"printf '%%s' '%s' > '%s'\\\",\\n\""), 1)
+        self.assertNotIn("sha256sum", runner)
+        self.assertNotIn("--ttl=0s", runner)
+        self.assertIn("verify_action_output", runner)
+        self.assertIn(r'\"action\":\"%s\"', runner)
+        self.assertIn(r'\"exit_code\":%d,', runner)
+        self.assertIn(r'\"signal\":%d,\"pass\":false}', runner)
+        self.assertIn("terminate_action(&action_a)", runner)
+        self.assertIn("terminate_action(&action_b)", runner)
+        self.assertIn("*failed_action_out = actions[index]", runner)
+        self.assertIn("record_action_status(action, status)", runner)
         self.assertTrue(lock.is_file())
         self.assertGreater(lock.stat().st_size, 0)
 

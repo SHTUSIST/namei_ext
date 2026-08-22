@@ -4,7 +4,7 @@ SPINDLE_STAGING_RQ2_BOOT_FILES := \
 	boot.json raw-runner.jsonl observations.jsonl stdout.log stderr.log \
 	kernel.config kernel-commit.txt kernel-release.txt uname.txt \
 	proc-version.txt kernel-cmdline.txt dmesg.log \
-	runtime-symlinks.txt runtime-mount-before.status \
+	runtime-symlinks.txt runtime-lower-fstype.txt runtime-mount-before.status \
 	runtime-mount-after.status guest-prepare.status guest-inner.status \
 	guest-cleanup.status guest-inventory-after.status guest-dmesg.status \
 	bpf-programs-before.json bpf-programs-after.json \
@@ -129,6 +129,7 @@ spindle-staging-rq2-host-gate: kernel kernel-provenance kernel-bpftool bpf \
 		workload-spindle-build spindle-staging-rq2-build \
 		spindle-staging-rq2-analysis-test
 	grep -Fx 'Final verdict: **GO**.' "$(SPINDLE_STAGING_RQ2_PLAN_REVIEW)"
+	grep -Fx 'Final amendment verdict: **GO**.' "$(SPINDLE_STAGING_RQ2_PLAN_REVIEW)"
 	test "$$(cat "$(KERNEL_COMMIT_FILE)")" = \
 		"$(SPINDLE_STAGING_RQ2_EXPECTED_KERNEL_COMMIT)"
 	grep -Fx 'CONFIG_FUSE_FS=y' "$(KERNEL_BUILD_DIR)/.config"
@@ -153,6 +154,7 @@ kvm-spindle-staging-rq2-preflight: experiment-source-clean kernel \
 	grep -Fx 'CONFIG_FUSE_FS=y' "$(KERNEL_BUILD_DIR)/.config"
 	grep -Fx 'CONFIG_FUSE_PASSTHROUGH=y' "$(KERNEL_BUILD_DIR)/.config"
 	grep -Fx 'Final verdict: **GO**.' "$(SPINDLE_STAGING_RQ2_PLAN_REVIEW)"
+	grep -Fx 'Final amendment verdict: **GO**.' "$(SPINDLE_STAGING_RQ2_PLAN_REVIEW)"
 	$(call SPINDLE_STAGING_RQ2_START,$(SPINDLE_STAGING_RQ2_PREFLIGHT_RESULT_DIR),1,1,5,make kvm-spindle-staging-rq2-preflight RUN_ID=$(RUN_ID))
 	if ! $(MAKE) -C "$(ROOT_DIR)" spindle-staging-rq2-run-matrix \
 		RUN_ID="$(RUN_ID)" \
@@ -466,11 +468,21 @@ __spindle_staging_rq2_guest_inner:
 	printf '%s\n' "$$runtime_mount_status" \
 		>"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/runtime-mount-before.status"; \
 	test "$$runtime_mount_status" -ne 0
-	mount --bind "$(SPINDLE_STAGING_RQ2_GUEST_RUNTIME_ABS)" \
+	mount -t tmpfs -o size=512m,mode=0755 tmpfs \
 		"$(SPINDLE_STAGING_RQ2_GUEST_COMPILED_ABS)"
 	mountpoint -q "$(SPINDLE_STAGING_RQ2_GUEST_COMPILED_ABS)"
+	cp -a "$(SPINDLE_STAGING_RQ2_GUEST_RUNTIME_ABS)/." \
+		"$(SPINDLE_STAGING_RQ2_GUEST_COMPILED_ABS)/"
+	(cd "$(SPINDLE_STAGING_RQ2_GUEST_COMPILED_ABS)" && \
+		find build prefix -type l -printf '%p\t%l\n' | LC_ALL=C sort) | \
+		cmp - "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/runtime-symlinks.txt"
 	test -x "$(SPINDLE_STAGING_RQ2_GUEST_SPINDLE_ABS)"
 	test -x "$(SPINDLE_STAGING_RQ2_GUEST_TEST_DIR_ABS)/test_driver"
+	findmnt -n -o FSTYPE -T \
+		"$(SPINDLE_STAGING_RQ2_GUEST_TEST_DIR_ABS)/test_driver" \
+		>"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/runtime-lower-fstype.txt"
+	grep -Fx 'tmpfs' \
+		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/runtime-lower-fstype.txt"
 	$(call NAMEI_EXT_GUEST_CAPTURE_EXTERNAL_INVENTORY,\
 		$(SPINDLE_STAGING_RQ2_BOOT_DIR),\
 		$(SPINDLE_STAGING_RQ2_GUEST_BPFTOOL),before)
@@ -482,6 +494,11 @@ __spindle_staging_rq2_guest_inner:
 	: >"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/stdout.log"
 	: >"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/stderr.log"
 	: >"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/raw-runner.jsonl"
+	runtime_fstype=$$(cat \
+		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/runtime-lower-fstype.txt"); \
+	jq -cn --arg runtime_fstype "$$runtime_fstype" \
+		'{event:"spindle-staging-rq2-lower-filesystem",runtime_fstype:$$runtime_fstype,pass:true}' \
+		>"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/raw-runner.jsonl"
 	"$(SPINDLE_STAGING_RQ2_GUEST_RUNNER)" "$(CONDITION)" \
 		"$(SPINDLE_STAGING_RQ2_GUEST_POLICY)" \
 		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/raw-runner.jsonl" \
@@ -517,6 +534,12 @@ __spindle_staging_rq2_guest_inner:
 	test "$$(jq -s '[.[] | select(.event == "spindle-staging-rq2-identity" and .bytes_equal == true and .pass == true)] | length' "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl")" = 47
 	jq -e 'select(.event == "spindle-staging-rq2-withdrawal" and .expected_diagnostic == true and .pass == true)' \
 		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null
+	jq -e 'select(.event == "spindle-staging-rq2-permission" and .observed_errno == 13 and .restore_errno == 0 and .pass == true)' \
+		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null
+	jq -e 'select(.event == "spindle-staging-rq2-withdrawal-lookup" and .operation == "fstatat" and .observed_errno == 2 and .expected_errno == 2 and .pass == true)' \
+		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null
+	jq -e 'select(.event == "spindle-staging-rq2-withdrawal-window" and .before == .after and ((.condition != "namei_ext") or (.hide_after > .hide_before)) and .pass == true)' \
+		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null
 	jq -e 'select(.event == "spindle-staging-rq2-summary" and .focal_objects == 47 and .failures == 0 and .pass == true)' \
 		"$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null
 	case "$(CONDITION)" in \
@@ -524,6 +547,7 @@ __spindle_staging_rq2_guest_inner:
 		jq -e 'select(.event == "spindle-staging-rq2-namei-window" and .select_delta == .per_target_sum and .select_delta >= 47 and .pass == true)' "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null ;; \
 	fuse) \
 		jq -e 'select(.event == "spindle-staging-rq2-fuse-config" and .libfuse_version == "3.18.2" and .allow_other == true and .default_permissions == true and .passthrough_negotiated == true and .pass == true)' "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null; \
+		test "$$(jq -s '[.[] | select(.event == "spindle-staging-rq2-fuse-invalidation" and .status == 0 and .inode_status == 0 and (.entry_status == 0 or .entry_status == -2) and .epoch_status == 0 and (.epoch_attempted == (.entry_status == -2)) and .pass == true)] | length' "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl")" = 3; \
 		jq -e 'select(.event == "spindle-staging-rq2-fuse-counter" and .counter == "read_fallback" and .delta == 0 and .pass == true)' "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null; \
 		jq -e 'select(.event == "spindle-staging-rq2-fuse-counter" and .counter == "passthrough_failure" and .delta == 0 and .pass == true)' "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null; \
 		jq -e 'select(.event == "spindle-staging-rq2-fuse-resource" and .cpu_runtime_ns > 0 and .pass == true)' "$(SPINDLE_STAGING_RQ2_BOOT_DIR)/observations.jsonl" >/dev/null ;; \

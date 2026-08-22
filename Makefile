@@ -53,6 +53,7 @@ include $(ROOT_DIR)/mk/experiments/spindle_staging.mk
 include $(ROOT_DIR)/mk/experiments/spindle_staging_rq2.mk
 include $(ROOT_DIR)/mk/experiments/toolchain_environment.mk
 include $(ROOT_DIR)/mk/experiments/kubernetes_configmap_publication.mk
+include $(ROOT_DIR)/mk/experiments/kubernetes_configmap_quantitative.mk
 include $(ROOT_DIR)/mk/experiments/semantic_continuation.mk
 include $(ROOT_DIR)/mk/benchmarks/fxmark.mk
 include $(ROOT_DIR)/mk/experiments/fxmark_fast_path.mk

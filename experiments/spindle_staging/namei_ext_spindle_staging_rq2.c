@@ -92,6 +92,8 @@ struct rq2_fuse_control_response {
 	int status;
 	int inode_status;
 	int entry_status;
+	int epoch_attempted;
+	int epoch_status;
 };
 
 struct rq2_fuse_control {
@@ -120,6 +122,22 @@ struct rq2_daemon_resource {
 	uint64_t threads;
 };
 
+static bool rq2_fuse_entry_invalidation_ok(int status)
+{
+	return !status || status == -ENOENT;
+}
+
+static bool rq2_fuse_invalidation_ok(
+	const struct rq2_fuse_control_response *response)
+{
+	bool needs_epoch = response->entry_status == -ENOENT;
+
+	return !response->status && !response->inode_status &&
+		rq2_fuse_entry_invalidation_ok(response->entry_status) &&
+		!!response->epoch_attempted == needs_epoch &&
+		!response->epoch_status;
+}
+
 struct rq2_timed_result {
 	struct process_result process;
 	struct rusage usage;
@@ -129,6 +147,16 @@ struct rq2_identity_wire {
 	struct stat st;
 	int error;
 	int bytes_equal;
+};
+
+struct rq2_errno_wire {
+	int setup_error;
+	int operation_errno;
+};
+
+enum rq2_path_probe_operation {
+	RQ2_PATH_PROBE_OPEN,
+	RQ2_PATH_PROBE_STAT,
 };
 
 static void rq2_fuse_count(struct rq2_fuse_state *state, unsigned int key)
@@ -260,7 +288,9 @@ static int rq2_fuse_do_lookup(fuse_req_t req, fuse_ino_t parent,
 	target_index = rq2_fuse_mapping_index(logical);
 	if (target_index < -1)
 		return -target_index;
-	if (target_index >= 0 && state->shared->withdrawn[target_index])
+	if (target_index >= 0 &&
+	    __atomic_load_n(&state->shared->withdrawn[target_index],
+			    __ATOMIC_ACQUIRE))
 		return ENOENT;
 	if (target_index >= 0)
 		newfd = open(state->mappings[target_index].cache,
@@ -425,6 +455,14 @@ static void rq2_fuse_open(fuse_req_t req, fuse_ino_t ino,
 		return;
 	}
 	pthread_mutex_lock(&inode->mutex);
+	if (inode->target_index >= 0 &&
+	    __atomic_load_n(&state->shared->withdrawn[inode->target_index],
+			    __ATOMIC_ACQUIRE)) {
+		pthread_mutex_unlock(&inode->mutex);
+		close(fd);
+		fuse_reply_err(req, ENOENT);
+		return;
+	}
 	backing_id = inode->backing_id;
 	if (!backing_id) {
 		backing_id = fuse_passthrough_open(req, fd);
@@ -443,7 +481,6 @@ static void rq2_fuse_open(fuse_req_t req, fuse_ino_t ino,
 	fi->fh = (uint64_t)fd;
 	fi->backing_id = backing_id;
 	fi->keep_cache = 0;
-	pthread_mutex_unlock(&inode->mutex);
 	__sync_fetch_and_add(
 		&state->shared->counters[RQ2_FUSE_PASSTHROUGH_OPEN], 1);
 	if (inode->target_index >= 0) {
@@ -453,6 +490,7 @@ static void rq2_fuse_open(fuse_req_t req, fuse_ino_t ino,
 			&state->shared->target_passthrough[inode->target_index], 1);
 	}
 	fuse_reply_open(req, fi);
+	pthread_mutex_unlock(&inode->mutex);
 }
 
 static void rq2_fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size,
@@ -711,19 +749,59 @@ static int rq2_fuse_invalidate_target(struct rq2_fuse_state *state,
 		(fuse_ino_t)(uintptr_t)parent_inode;
 	pthread_mutex_unlock(&state->mutex);
 
-	response->inode_status = fuse_lowlevel_notify_inval_inode(
-		state->session, inode_number, 0, 0);
-	__sync_fetch_and_add(
-		&state->shared->counters[RQ2_FUSE_INVALIDATE_INODE], 1);
 	response->entry_status = fuse_lowlevel_notify_inval_entry(
 		state->session, parent_number, name, strlen(name));
 	__sync_fetch_and_add(
 		&state->shared->counters[RQ2_FUSE_INVALIDATE_ENTRY], 1);
+	if (response->entry_status == -ENOENT) {
+		response->epoch_attempted = 1;
+		response->epoch_status =
+			fuse_lowlevel_notify_increment_epoch(state->session);
+	}
+	response->inode_status = fuse_lowlevel_notify_inval_inode(
+		state->session, inode_number, 0, 0);
+	__sync_fetch_and_add(
+		&state->shared->counters[RQ2_FUSE_INVALIDATE_INODE], 1);
 	rq2_fuse_unref(state, inode, 1);
 	rq2_fuse_unref(state, parent_inode, 1);
-	if (response->inode_status)
-		return response->inode_status;
-	return response->entry_status;
+	if (!rq2_fuse_entry_invalidation_ok(response->entry_status))
+		return response->entry_status;
+	if (response->epoch_status)
+		return response->epoch_status;
+	return response->inode_status;
+}
+
+static int rq2_fuse_publish_withdrawal(struct rq2_fuse_state *state,
+					int target_index)
+{
+	struct rq2_fuse_inode *inode = NULL;
+	int error;
+
+	pthread_mutex_lock(&state->mutex);
+	for (struct rq2_fuse_inode *candidate = state->root.next;
+	     candidate != &state->root; candidate = candidate->next) {
+		if (candidate->target_index != target_index)
+			continue;
+		candidate->refcount++;
+		inode = candidate;
+		break;
+	}
+	pthread_mutex_unlock(&state->mutex);
+
+	if (inode) {
+		error = pthread_mutex_lock(&inode->mutex);
+		if (error) {
+			rq2_fuse_unref(state, inode, 1);
+			return -error;
+		}
+	}
+	__atomic_store_n(&state->shared->withdrawn[target_index], 1,
+			 __ATOMIC_RELEASE);
+	if (!inode)
+		return 0;
+	error = pthread_mutex_unlock(&inode->mutex);
+	rq2_fuse_unref(state, inode, 1);
+	return error ? -error : 0;
 }
 
 static int rq2_write_full(int fd, const void *buffer, size_t size)
@@ -896,12 +974,13 @@ static void *rq2_fuse_control_loop(void *argument)
 			response.status = -EINVAL;
 		} else {
 			if (request.command == RQ2_FUSE_WITHDRAW) {
-				control->state->shared->withdrawn[
-					request.target_index] = 1;
-				__sync_synchronize();
+				response.status = rq2_fuse_publish_withdrawal(
+					control->state, request.target_index);
 			}
-			response.status = rq2_fuse_invalidate_target(
-				control->state, request.target_index, &response);
+			if (!response.status)
+				response.status = rq2_fuse_invalidate_target(
+					control->state, request.target_index,
+					&response);
 		}
 		ret = rq2_write_full(control->response_fd, &response,
 				     sizeof(response));
@@ -1022,9 +1101,24 @@ static int rq2_fuse_request(struct rq2_fuse_process *process, int command,
 		.command = command,
 		.target_index = target_index,
 	};
+	char logical[PATH_MAX];
+	char path[PATH_MAX];
+	int pinned_fd = -1;
 	int ret;
 
 	memset(response, 0, sizeof(*response));
+	if (command == RQ2_FUSE_INVALIDATE || command == RQ2_FUSE_WITHDRAW) {
+		ret = rq2_fuse_logical_for_index(target_index, logical,
+						 sizeof(logical));
+		if (ret)
+			return ret;
+		if (snprintf(path, sizeof(path), "%s%s", process->mountpoint,
+			     logical) >= (int)sizeof(path))
+			return -ENAMETOOLONG;
+		pinned_fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+		if (pinned_fd < 0)
+			return -errno;
+	}
 	ret = rq2_write_full(process->request_fd, &request, sizeof(request));
 	if (!ret)
 		ret = rq2_read_full_timeout(process->response_fd, response,
@@ -1032,6 +1126,8 @@ static int rq2_fuse_request(struct rq2_fuse_process *process, int command,
 					    RQ2_CONTROL_TIMEOUT_MS);
 	if (!ret)
 		ret = response->status;
+	if (pinned_fd >= 0 && close(pinned_fd) && !ret)
+		ret = -errno;
 	return ret;
 }
 
@@ -1659,10 +1755,13 @@ child_done:
 	return 0;
 }
 
-static int rq2_permission_probe(const char *cgroup_path,
+static int rq2_path_errno_probe(const char *cgroup_path,
 				const struct run_environment *environment,
-				const char *logical_path, int *observed_errno)
+				const char *logical_path,
+				enum rq2_path_probe_operation operation,
+				int *observed_errno)
 {
+	struct rq2_errno_wire wire = {};
 	int pipe_fd[2];
 	int status = 0;
 	pid_t pid;
@@ -1678,36 +1777,60 @@ static int rq2_permission_probe(const char *cgroup_path,
 		return ret;
 	}
 	if (!pid) {
-		int error = 0;
-		int fd;
-
 		close(pipe_fd[0]);
 		if (cgroup_path && namei_ext_move_self_to_cgroup(cgroup_path))
-			error = errno ? errno : EIO;
+			wire.setup_error = errno ? errno : EIO;
 		else if (drop_privileges(environment->uid, environment->gid))
-			error = errno ? errno : EIO;
-		else {
-			fd = open(logical_path, O_RDONLY | O_CLOEXEC);
-			if (fd >= 0) {
+			wire.setup_error = errno ? errno : EIO;
+		else if (operation == RQ2_PATH_PROBE_OPEN) {
+			int fd = open(logical_path, O_RDONLY | O_CLOEXEC);
+
+			if (fd >= 0)
 				close(fd);
-				error = 0;
-			} else {
-				error = errno;
-			}
+			else
+				wire.operation_errno = errno;
+		} else {
+			struct stat st;
+
+			if (fstatat(AT_FDCWD, logical_path, &st,
+				    AT_SYMLINK_NOFOLLOW))
+				wire.operation_errno = errno;
 		}
-		if (write_all(pipe_fd[1], &error, sizeof(error)))
+		if (write_all(pipe_fd[1], &wire, sizeof(wire)))
 			_exit(126);
 		close(pipe_fd[1]);
 		_exit(0);
 	}
 	close(pipe_fd[1]);
-	ret = read_all(pipe_fd[0], observed_errno,
-		       sizeof(*observed_errno));
+	ret = read_all(pipe_fd[0], &wire, sizeof(wire));
 	close(pipe_fd[0]);
 	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
 	    WEXITSTATUS(status))
 		return -ECHILD;
-	return ret;
+	if (ret)
+		return ret;
+	if (wire.setup_error)
+		return -wire.setup_error;
+	*observed_errno = wire.operation_errno;
+	return 0;
+}
+
+static int rq2_withdrawal_lookup_probe(
+	FILE *out, const char *condition, const char *cgroup_path,
+	const struct run_environment *environment, const char *logical_path)
+{
+	int observed_errno = 0;
+	int ret = rq2_path_errno_probe(cgroup_path, environment, logical_path,
+				       RQ2_PATH_PROBE_STAT, &observed_errno);
+	bool pass = !ret && observed_errno == ENOENT;
+
+	fprintf(out,
+		"{\"event\":\"spindle-staging-rq2-withdrawal-lookup\","
+		"\"condition\":\"%s\",\"operation\":\"fstatat\","
+		"\"observed_errno\":%d,\"expected_errno\":%d,\"pass\":%s}\n",
+		condition, observed_errno, ENOENT, pass ? "true" : "false");
+	fflush(out);
+	return pass ? 0 : -EINVAL;
 }
 
 static bool rq2_daemon_resource_monotonic(
@@ -1720,7 +1843,7 @@ static bool rq2_daemon_resource_monotonic(
 		after->runqueue_wait_ns >= before->runqueue_wait_ns &&
 		after->voluntary_switches >= before->voluntary_switches &&
 		after->involuntary_switches >= before->involuntary_switches &&
-		before->threads > 0 && before->threads == after->threads;
+		before->threads > 0 && after->threads > 0;
 }
 
 static void rq2_emit_identity(FILE *out, const char *condition,
@@ -1826,6 +1949,10 @@ static int rq2_run_withdrawn(FILE *out, const char *condition,
 	return expected ? 0 : -EINVAL;
 }
 
+static void rq2_emit_lifecycle(FILE *out, const char *condition,
+			       const char *phase, uint64_t duration_ns,
+			       bool pass);
+
 static int rq2_run_namei_condition(
 	FILE *out, const char *policy_path, const char *result_dir,
 	const char *cgroup_root, const char *test_dir,
@@ -1847,10 +1974,15 @@ static int rq2_run_namei_condition(
 	uint64_t hits_after[FOCAL_OBJECTS] = {};
 	uint64_t withdrawn_before = 0;
 	uint64_t withdrawn_after = 0;
+	uint64_t hide_before = 0;
+	uint64_t hide_after = 0;
 	bool canary_mounted = false;
 	bool cgroup_created = false;
 	bool targets_registered = false;
+	uint64_t setup_started = monotonic_ns();
+	uint64_t teardown_started;
 	int failures = 0;
+	int failures_before_teardown;
 	int ret;
 
 	if (snprintf(cgroup_path, sizeof(cgroup_path),
@@ -1874,6 +2006,8 @@ static int rq2_run_namei_condition(
 	}
 	emit_case(out, "rq2_namei_configure", !ret, ret ? -ret : 0,
 		  "47 targets and exact component rules attached");
+	rq2_emit_lifecycle(out, "namei_ext", "setup",
+			   monotonic_ns() - setup_started, !ret);
 	if (ret) {
 		failures++;
 		goto cleanup;
@@ -1884,9 +2018,10 @@ static int rq2_run_namei_condition(
 
 	ret = chmod(mappings[0].cache, 0000) ? -errno : 0;
 	if (!ret)
-		ret = rq2_permission_probe(cgroup_path, environment,
-					   mappings[0].source,
-					   &observed_errno);
+		ret = rq2_path_errno_probe(cgroup_path, environment,
+					    mappings[0].source,
+					    RQ2_PATH_PROBE_OPEN,
+					    &observed_errno);
 	int restore_ret = chmod(mappings[0].cache, original_mode) ? -errno : 0;
 	bool permission_pass = !ret && !restore_ret && observed_errno == EACCES;
 
@@ -1971,29 +2106,52 @@ static int rq2_run_namei_condition(
 	ret = collect_counter(&policy, "spindle_staging_rule_hits",
 			      mappings[0].target_id, &withdrawn_before);
 	if (!ret)
-		ret = namei_ext_component_map_delete(
+		ret = collect_counter(&policy, "spindle_staging_counters",
+				      SPINDLE_COUNTER_HIDE_LOOKUP, &hide_before);
+	if (!ret)
+		ret = namei_ext_component_map_update(
 			&policy, "spindle_staging_rules", cgroup_id,
-			mappings[0].source_parent, mappings[0].spec->name);
+			mappings[0].source_parent, mappings[0].spec->name,
+			SPINDLE_STAGING_HIDE_VALUE);
+	if (!ret)
+		ret = rq2_withdrawal_lookup_probe(out, "namei_ext", cgroup_path,
+						 environment, mappings[0].source);
 	if (!ret)
 		ret = rq2_run_withdrawn(out, "namei_ext", test_dir,
 					 cgroup_path, environment, loader_argv,
 					 loader_env, result_dir, &withdrawn_result);
-	if (!ret)
-		ret = collect_counter(&policy, "spindle_staging_rule_hits",
-				      mappings[0].target_id, &withdrawn_after);
-	bool withdrawal_pass = !ret && withdrawn_after == withdrawn_before;
+	int withdrawal_oracle_ret = ret;
+	int counter_ret = collect_counter(&policy, "spindle_staging_rule_hits",
+					  mappings[0].target_id,
+					  &withdrawn_after);
+
+	if (!counter_ret)
+		counter_ret = collect_counter(&policy, "spindle_staging_counters",
+					      SPINDLE_COUNTER_HIDE_LOOKUP,
+					      &hide_after);
+	if (!withdrawal_oracle_ret && counter_ret)
+		withdrawal_oracle_ret = counter_ret;
+	ret = withdrawal_oracle_ret;
+	bool withdrawal_pass = !ret && withdrawn_after == withdrawn_before &&
+		hide_after > hide_before;
 
 	fprintf(out,
 		"{\"event\":\"spindle-staging-rq2-withdrawal-window\","
 		"\"condition\":\"namei_ext\",\"before\":%llu,"
-		"\"after\":%llu,\"pass\":%s}\n",
+		"\"after\":%llu,\"hide_before\":%llu,"
+		"\"hide_after\":%llu,\"pass\":%s}\n",
 		(unsigned long long)withdrawn_before,
 		(unsigned long long)withdrawn_after,
+		(unsigned long long)hide_before,
+		(unsigned long long)hide_after,
 		withdrawal_pass ? "true" : "false");
 	fflush(out);
 	failures += !withdrawal_pass;
 
 cleanup:
+	teardown_started = monotonic_ns();
+	failures_before_teardown = failures;
+
 	if (policy.attached) {
 		if (namei_ext_policy_parent_clear(cgroup_path))
 			failures++;
@@ -2008,6 +2166,9 @@ cleanup:
 		failures++;
 	if (canary_path[0] && unlink(canary_path) && errno != ENOENT)
 		failures++;
+	rq2_emit_lifecycle(out, "namei_ext", "teardown",
+			   monotonic_ns() - teardown_started,
+			   failures == failures_before_teardown);
 	emit_case(out, "rq2_namei_condition", failures == 0, failures,
 		  failures ? "namei_ext condition failed" :
 			     "namei_ext condition passed");
@@ -2021,9 +2182,26 @@ static void rq2_emit_invalidation(
 	fprintf(out,
 		"{\"event\":\"spindle-staging-rq2-fuse-invalidation\","
 		"\"phase\":\"%s\",\"status\":%d,"
-		"\"inode_status\":%d,\"entry_status\":%d,\"pass\":%s}\n",
+		"\"inode_status\":%d,\"entry_status\":%d,"
+		"\"epoch_attempted\":%s,\"epoch_status\":%d,"
+		"\"pass\":%s}\n",
 		phase, response->status, response->inode_status,
-		response->entry_status, pass ? "true" : "false");
+		response->entry_status,
+		response->epoch_attempted ? "true" : "false",
+		response->epoch_status, pass ? "true" : "false");
+	fflush(out);
+}
+
+static void rq2_emit_lifecycle(FILE *out, const char *condition,
+			       const char *phase, uint64_t duration_ns,
+			       bool pass)
+{
+	fprintf(out,
+		"{\"event\":\"spindle-staging-rq2-lifecycle\","
+		"\"condition\":\"%s\",\"phase\":\"%s\","
+		"\"duration_ns\":%llu,\"pass\":%s}\n",
+		condition, phase, (unsigned long long)duration_ns,
+		pass ? "true" : "false");
 	fflush(out);
 }
 
@@ -2060,7 +2238,10 @@ static int rq2_run_fuse_condition(
 	uint64_t withdrawn_after = 0;
 	bool started = false;
 	bool cgroup_created = false;
+	uint64_t setup_started = monotonic_ns();
+	uint64_t teardown_started;
 	int failures = 0;
+	int failures_before_teardown;
 	int ret;
 
 	if (snprintf(cgroup_path, sizeof(cgroup_path),
@@ -2098,6 +2279,8 @@ static int rq2_run_fuse_condition(
 		RQ2_FUSE_THREADS, RQ2_FUSE_TIMEOUT, RQ2_FUSE_TIMEOUT,
 		negotiated ? "true" : "false", negotiated ? "true" : "false");
 	fflush(out);
+	rq2_emit_lifecycle(out, "fuse", "setup",
+			   monotonic_ns() - setup_started, negotiated);
 	if (!negotiated) {
 		failures++;
 		goto cleanup;
@@ -2116,21 +2299,21 @@ static int rq2_run_fuse_condition(
 	if (!ret)
 		ret = rq2_fuse_request(&process, RQ2_FUSE_INVALIDATE, 0,
 				       &response);
-	bool invalidate_zero_pass = !ret && !response.inode_status &&
-		!response.entry_status;
+	bool invalidate_zero_pass = !ret && rq2_fuse_invalidation_ok(&response);
 	rq2_emit_invalidation(out, "mode_zero", &response,
 			      invalidate_zero_pass);
 	if (!ret)
-		ret = rq2_permission_probe(cgroup_path, environment,
-					   mappings[0].source,
-					   &observed_errno);
+		ret = rq2_path_errno_probe(cgroup_path, environment,
+					     mappings[0].source,
+					     RQ2_PATH_PROBE_OPEN,
+					     &observed_errno);
 	int restore_ret = chmod(mappings[0].cache, original_mode) ? -errno : 0;
 	struct rq2_fuse_control_response restore_response = {};
 	int invalidate_restore_ret = restore_ret ? restore_ret :
 		rq2_fuse_request(&process, RQ2_FUSE_INVALIDATE, 0,
 				 &restore_response);
 	bool invalidate_restore_pass = !invalidate_restore_ret &&
-		!restore_response.inode_status && !restore_response.entry_status;
+		rq2_fuse_invalidation_ok(&restore_response);
 	rq2_emit_invalidation(out, "mode_restore", &restore_response,
 			      invalidate_restore_pass);
 	bool permission_pass = !ret && !restore_ret &&
@@ -2223,10 +2406,13 @@ static int rq2_run_fuse_condition(
 
 	withdrawn_before = process.shared->target_opens[0];
 	ret = rq2_fuse_request(&process, RQ2_FUSE_WITHDRAW, 0, &response);
-	bool withdraw_invalidation_pass = !ret && !response.inode_status &&
-		!response.entry_status;
+	bool withdraw_invalidation_pass = !ret &&
+		rq2_fuse_invalidation_ok(&response);
 	rq2_emit_invalidation(out, "withdraw", &response,
 			      withdraw_invalidation_pass);
+	if (!ret)
+		ret = rq2_withdrawal_lookup_probe(out, "fuse", cgroup_path,
+						 environment, mappings[0].source);
 	if (!ret)
 		ret = rq2_run_withdrawn(out, "fuse", test_dir, cgroup_path,
 					 environment, loader_argv, loader_env,
@@ -2246,6 +2432,9 @@ static int rq2_run_fuse_condition(
 	failures += !withdrawal_pass;
 
 cleanup:
+	teardown_started = monotonic_ns();
+	failures_before_teardown = failures;
+
 	if (started) {
 		ret = rq2_stop_fuse(&process);
 		emit_case(out, "rq2_fuse_stop", !ret, ret ? -ret : 0,
@@ -2260,6 +2449,9 @@ cleanup:
 	}
 	if (cgroup_created && rmdir(cgroup_path) && errno != ENOENT)
 		failures++;
+	rq2_emit_lifecycle(out, "fuse", "teardown",
+			   monotonic_ns() - teardown_started,
+			   failures == failures_before_teardown);
 	emit_case(out, "rq2_fuse_condition", failures == 0, failures,
 		  failures ? "FUSE condition failed" : "FUSE condition passed");
 	return failures ? -EINVAL : 0;

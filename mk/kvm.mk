@@ -21,6 +21,8 @@ NAMEI_EXT_VNG_RUN_FLAGS ?=
 NAMEI_EXT_KVM_CAPTURE_NATIVE_PIN ?= 0
 NAMEI_EXT_KVM_CAPTURE_QMP_LISTENER_TIMEOUT ?= 30
 NAMEI_EXT_KVM_CAPTURE_VERIFY_INITIAL_DELAY ?= 0
+NAMEI_EXT_KVM_CAPTURE_BLOCK_IMAGE ?=
+NAMEI_EXT_KVM_CAPTURE_DEFER_FAILURE_MARK ?= 0
 
 define NAMEI_EXT_VALIDATE_HOST_CPU_PIN
 printf '%s\n' "$(1)" | grep -Eq '^[0-9]+-[0-9]+$$'; \
@@ -43,7 +45,7 @@ done
 endef
 
 define NAMEI_EXT_KVM_RUN_IMAGE
-$(if $(5),timeout --signal=TERM --kill-after=10s "$(5)") $(VNG) $(NAMEI_EXT_VNG_RUN_FLAGS) $(if $(4),--qemu-opts='-qmp tcp:$(NAMEI_EXT_QMP_HOST):$(NAMEI_EXT_QMP_PORT)$(NAMEI_EXT_COMMA)server=on$(NAMEI_EXT_COMMA)wait=off') --run "$(1)" $(VNG_MODULE_FLAGS) --user root --cwd "$(ROOT_DIR)" --disable-monitor --cpus "$(KVM_CPUS)" --memory "$(KVM_MEM)" --rwdir "$(ROOT_DIR)" --overlay-rwdir /tmp --append "$(KVM_APPEND)" --exec "$(MAKE) -C $(ROOT_DIR) $(2) RUN_ID=$(RUN_ID) $(3)"
+$(if $(5),timeout --signal=TERM --kill-after=10s "$(5)") $(VNG) $(NAMEI_EXT_VNG_RUN_FLAGS) $(if $(6),--disable-microvm) $(if $(or $(4),$(6)),--qemu-opts='$(if $(4),-qmp tcp:$(NAMEI_EXT_QMP_HOST):$(NAMEI_EXT_QMP_PORT)$(NAMEI_EXT_COMMA)server=on$(NAMEI_EXT_COMMA)wait=off)$(if $(and $(4),$(6)), )$(if $(6),-drive file=$(6)$(NAMEI_EXT_COMMA)format=raw$(NAMEI_EXT_COMMA)if=none$(NAMEI_EXT_COMMA)id=namei_ext_workload$(NAMEI_EXT_COMMA)cache=none -device virtio-blk-pci$(NAMEI_EXT_COMMA)drive=namei_ext_workload$(NAMEI_EXT_COMMA)serial=namei_ext_w4)') --run "$(1)" $(VNG_MODULE_FLAGS) --user root --cwd "$(ROOT_DIR)" --disable-monitor --cpus "$(KVM_CPUS)" --memory "$(KVM_MEM)" --rwdir "$(ROOT_DIR)" --overlay-rwdir /tmp --append "$(KVM_APPEND)" --exec "$(MAKE) -C $(ROOT_DIR) $(2) RUN_ID=$(RUN_ID) $(3)"
 endef
 
 define NAMEI_EXT_KVM_RUN
@@ -57,7 +59,7 @@ endef
 define NAMEI_EXT_KVM_RUN_CAPTURE
 if test -n "$(6)"; then \
 	launcher_status=0; pin_status=0; affinity_status=0; listener_status=0; \
-	$(call NAMEI_EXT_KVM_RUN_IMAGE,$(1),$(2),$(3),$(if $(filter 1,$(NAMEI_EXT_KVM_CAPTURE_NATIVE_PIN)),,$(6)),$(7)) \
+	$(call NAMEI_EXT_KVM_RUN_IMAGE,$(1),$(2),$(3),$(if $(filter 1,$(NAMEI_EXT_KVM_CAPTURE_NATIVE_PIN)),,$(6)),$(7),$(8)) \
 		>"$(4)/launcher.stdout.log" 2>"$(4)/launcher.stderr.log" & \
 	launcher_pid=$$!; \
 	if test "$(NAMEI_EXT_KVM_CAPTURE_NATIVE_PIN)" = 1; then \
@@ -108,15 +110,22 @@ if test -n "$(6)"; then \
 				test "$$launcher_status" -ne 0 && test "$$affinity_status" -ne 0; then \
 			failure=kvm-launch-and-affinity-verification; \
 		elif test "$$affinity_status" -ne 0; then failure=vcpu-affinity-verification; fi; \
-		failed_at=$$(date -u +%Y-%m-%dT%H:%M:%SZ); \
-		$(call NAMEI_EXT_MARK_RUN_FAILED,$(5),$$failed_at,$$failure) || exit 1; \
+		printf '%s\n' "$$failure" >"$(4)/kvm-capture-failure.txt"; \
+		if test "$(NAMEI_EXT_KVM_CAPTURE_DEFER_FAILURE_MARK)" = 0; then \
+			failed_at=$$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+			$(call NAMEI_EXT_MARK_RUN_FAILED,$(5),$$failed_at,$$failure) || exit 1; \
+		fi; \
 		exit 1; \
 	fi; \
 else \
-	if ! $(call NAMEI_EXT_KVM_RUN_IMAGE,$(1),$(2),$(3),,$(7)) \
+	if ! $(call NAMEI_EXT_KVM_RUN_IMAGE,$(1),$(2),$(3),,$(7),$(8)) \
 			>"$(4)/launcher.stdout.log" 2>"$(4)/launcher.stderr.log"; then \
-		failed_at=$$(date -u +%Y-%m-%dT%H:%M:%SZ); \
-		$(call NAMEI_EXT_MARK_RUN_FAILED,$(5),$$failed_at,kvm-launch-or-guest-command) || exit 1; \
+		failure=kvm-launch-or-guest-command; \
+		printf '%s\n' "$$failure" >"$(4)/kvm-capture-failure.txt"; \
+		if test "$(NAMEI_EXT_KVM_CAPTURE_DEFER_FAILURE_MARK)" = 0; then \
+			failed_at=$$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+			$(call NAMEI_EXT_MARK_RUN_FAILED,$(5),$$failed_at,$$failure) || exit 1; \
+		fi; \
 		exit 1; \
 	fi; \
 fi
@@ -159,6 +168,10 @@ __namei_ext_kvm_capture:
 	test -n "$(NAMEI_EXT_KVM_CAPTURE_GUEST_TARGET)"
 	test -d "$(NAMEI_EXT_KVM_CAPTURE_BOOT_DIR)"
 	test -f "$(NAMEI_EXT_KVM_CAPTURE_RUN_DIR)/run.json"
+	case "$(NAMEI_EXT_KVM_CAPTURE_DEFER_FAILURE_MARK)" in 0|1) ;; *) exit 1;; esac
+	if test -n "$(NAMEI_EXT_KVM_CAPTURE_BLOCK_IMAGE)"; then \
+		test -f "$(NAMEI_EXT_KVM_CAPTURE_BLOCK_IMAGE)"; \
+	fi
 	jq -e --arg run_id "$(RUN_ID)" \
 		'.run_id == $$run_id and .status == "running" and (.completed_at | not) and (.failed_at | not)' \
 		"$(NAMEI_EXT_KVM_CAPTURE_RUN_DIR)/run.json" >/dev/null
@@ -170,7 +183,7 @@ __namei_ext_kvm_capture:
 	else \
 		test -z "$(NAMEI_EXT_KVM_CAPTURE_REQUIRE_EMPTY)"; \
 	fi
-	$(call NAMEI_EXT_KVM_RUN_CAPTURE,$(strip $(NAMEI_EXT_KVM_CAPTURE_IMAGE)),$(strip $(NAMEI_EXT_KVM_CAPTURE_GUEST_TARGET)),$(strip $(NAMEI_EXT_KVM_CAPTURE_GUEST_VARS)),$(strip $(NAMEI_EXT_KVM_CAPTURE_BOOT_DIR)),$(strip $(NAMEI_EXT_KVM_CAPTURE_RUN_DIR)),$(strip $(NAMEI_EXT_KVM_CAPTURE_HOST_CPUS)),$(strip $(NAMEI_EXT_KVM_CAPTURE_TIMEOUT)))
+	$(call NAMEI_EXT_KVM_RUN_CAPTURE,$(strip $(NAMEI_EXT_KVM_CAPTURE_IMAGE)),$(strip $(NAMEI_EXT_KVM_CAPTURE_GUEST_TARGET)),$(strip $(NAMEI_EXT_KVM_CAPTURE_GUEST_VARS)),$(strip $(NAMEI_EXT_KVM_CAPTURE_BOOT_DIR)),$(strip $(NAMEI_EXT_KVM_CAPTURE_RUN_DIR)),$(strip $(NAMEI_EXT_KVM_CAPTURE_HOST_CPUS)),$(strip $(NAMEI_EXT_KVM_CAPTURE_TIMEOUT)),$(strip $(NAMEI_EXT_KVM_CAPTURE_BLOCK_IMAGE)))
 
 __namei_ext_guest_prepare:
 	if ! mountpoint -q /sys/fs/bpf; then mount -t bpf bpf /sys/fs/bpf; fi
@@ -234,6 +247,8 @@ __phase1_guest_functional:
 	if ! mountpoint -q /sys/kernel/debug; then mount -t debugfs debugfs /sys/kernel/debug; fi
 	if ! mountpoint -q /sys/fs/cgroup; then mount -t cgroup2 cgroup2 /sys/fs/cgroup; fi
 	"$(BUILD_ROOT)/functional/namei_ext_functional" "$(BUILD_ROOT)/bpf/redirect_alias.bpf.o" "$(PHASE1_RESULT_DIR)/functional.jsonl" /sys/fs/cgroup "$(BUILD_ROOT)/bpf/hide_secret.bpf.o" "$(BUILD_ROOT)/bpf/select_portal.bpf.o"
+	jq -s -e -f "$(ROOT_DIR)/tests/functional/validate_target_batch.jq" \
+		"$(PHASE1_RESULT_DIR)/functional.jsonl" >/dev/null
 	dmesg >"$(PHASE1_RESULT_DIR)/dmesg-functional.log"
 	printf '{"event":"functional-done","run_id":"%s"}\n' "$(RUN_ID)" >>"$(PHASE1_RESULT_DIR)/functional.jsonl"
 

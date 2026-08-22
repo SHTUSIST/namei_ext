@@ -25,6 +25,7 @@
 #define FOCAL_OBJECTS 47
 #define EXPECTED_LOADER_PROGRESS 44
 #define SPINDLE_TARGET_MAX 64
+#define SPINDLE_STAGING_HIDE_VALUE 0U
 #define CACHE_ROOT "/tmp/namei-ext-spindle-cache"
 #define COMM_ROOT "/tmp/namei-ext-spindle-comm"
 #define TMP_ROOT "/tmp/namei-ext-spindle-tmp"
@@ -38,6 +39,9 @@ enum spindle_staging_counter {
 	SPINDLE_COUNTER_LOOKUP = 1,
 	SPINDLE_COUNTER_SELECT = 2,
 	SPINDLE_COUNTER_PASS = 3,
+	SPINDLE_COUNTER_READDIR = 4,
+	SPINDLE_COUNTER_HIDE_LOOKUP = 5,
+	SPINDLE_COUNTER_HIDE_READDIR = 6,
 };
 
 struct focal_spec {
