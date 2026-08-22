@@ -42,7 +42,7 @@
 
 **裁决:agent-sandbox-FS 赛道在 2026 已相当拥挤,且竞品大多能力更强(支持写/隔离/快照)。** 主要竞品:
 
-- **YoloFS / AgentFS(Microsoft,arXiv [2604.13536](https://arxiv.org/abs/2604.13536))** — coding-agent fs,目标 safety/undo + 权限门控(staging/overlay),控制写是否 commit;非 in-VFS redirect。
+- **YoloFS / AgentFS(Microsoft,SOSP 2026,arXiv [2604.13536](https://arxiv.org/abs/2604.13536))** — coding-agent fs,目标 safety/undo + 权限门控(staging/overlay),控制写是否 commit;非 in-VFS redirect。
 - **Sandlock(arXiv [2605.26298](https://arxiv.org/abs/2605.26298))** — 用 Landlock+seccomp 约束 agent;占的是 namei_ext **明确免责**的 allow/deny/confine 轴。
 - **AgentFS(Turso,FUSE+SQLite CoW)** / **Fault-Tolerant Transactional Sandboxing(arXiv [2512.12806](https://arxiv.org/abs/2512.12806))** — 仍付 FUSE 税、做隔离/事务回滚而非 redirect。
 - **既有"廉价可写 fanout"基线(对主打动机的釜底抽薪)**:overlay snapshots + btrfs/XFS **reflink CoW**、**git worktree**(Cursor 2.0 Agents Window 已用)、OSGym(reflink CoW replicas,arXiv 2511.11672)、E2B/Modal directory-snapshots/Daytona/OpenAI Codex(clone@SHA+container cache)/microsandbox。**它们都提供完整可写分支 + 近原生读 + 毫秒级 setup——正是 agent workspace fork 要的,而 namei_ext 明确不提供写。**
