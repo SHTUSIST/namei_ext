@@ -1,5 +1,15 @@
 # Experiment Plan: RQ2 Per-View Supply Cost Versus Mount-Based Views
 
+## 2026-08-22 更新:宿主基线这一半已经跑完,方向与本计划书写的预期相反
+
+本计划书正文写于 2026-08-05。这一段是 2026-08-22 补写的,读正文之前先知道三件事。
+
+1. **宿主基线这一半已经跑完。** 结果根目录是 `results/experiments/view-supply-cost-host/20260808T155425Z-formal01/`。
+
+2. **跑完的只是 `## Comparison` 一节四个条件里的三个基线条件,而且是在宿主内核上跑的,不是在改过内核的虚拟机里跑的。** 跑到的是条件 1(每视图一个挂载命名空间加绑定挂载)、条件 2(每视图一次 overlayfs 挂载)、条件 3(每视图一次块级克隆)。条件 4(namei_ext,每视图几条策略规则)那一侧一个数都没有:`summary.json` 里写着 `namei_ext_measured: false`,`report.md` 开头那句话是 `namei_ext is not in this table. It needs the patched kernel in KVM, so its column is absent rather than estimated.`
+
+3. **实测结果落在本计划书 `## Expected And Alternative Outcomes` 一节自己写的「替代结果一(差距不显著)」那一档。** 该节写的预期是「挂载路线的成本随视图数量线性增长,并且在挂载操作的全局锁上出现排队」,而实测在 1 到 1000 份视图这个区间里没有看到这件事。按 `## Planned Runs` 一节预先声明的判决规则,对应的论文动作是:不能主张每视图供给成本优势,只保留「可以在运行中改答案」这条能力主张,同时明写在成本上没有优势。宿主基线这一半到底证明了什么,写在 `## Interpretation` 一节末尾的 2026-08-22 补充里。
+
 ## Research Question
 
 - 论文里写的研究问题(逐字保留原意):相对于功能等价的 FUSE 实现,把可编程策略放到 VFS 名字解析路径上的代价是多少。
@@ -27,7 +37,10 @@
 
 - 第三方已发表的相关测量:TClone(arXiv 2605.17320,标题 `TClone: Low-Latency Forking of Live GUI Environments for Computer-Use Agents`)第 5.3.3 节测了 overlayfs 随分支深度的表现,原句是 `Only a cold shared read (read_ro) walks the chain, growing linearly with no per-layer compounding from about 1.3 ms to about 5.7 ms at depth 50`,以及 `Thus, OverlayFS inflates every lower-layer read as the union deepens, unsuitable for read-heavy and snapshot frequent CUA branching.`
 - 页缓存重复的依据:LWN 2022-05-24,Jake Edge,原句是 `When two files share an extent, their inodes point at the same data blocks on the disk, though they seem to be completely independent files.` 与 `When those files are read, each gets copied separately into the page cache.`
-- 我方此前的实测数字(**未在本轮重跑,需要在本实验里重新测一遍**):每条挂载表项静态占 35–47.5 KB;复制一次挂载命名空间 47.8 / 184.7 / 794.3 微秒;挂载操作在压力下等 1.27 秒、空载 5.9 毫秒。
+- 我方此前的实测数字,原文是:每条挂载表项静态占 35–47.5 KB;复制一次挂载命名空间 47.8 / 184.7 / 794.3 微秒;挂载操作在压力下等 1.27 秒、空载 5.9 毫秒。**2026-08-22 逐条对照 `results/experiments/view-supply-cost-host/20260808T155425Z-formal01/` 之后,三条数字的处理如下。**
+    - 「每条挂载表项静态占 35–47.5 KB」→ **已被本轮重测取代。** 扣掉对照之后,每份视图占的 slab 内存(slab 是内核给自己的数据结构分配内存的那一部分,一份绑定挂载视图在内核里的那几个结构体就记在这里)在 100 份与 1000 份两档上分别是 12.68 KB 与 11.364 KB,比旧数小约三到四倍。旧数不再引用。
+    - 「复制一次挂载命名空间 47.8 / 184.7 / 794.3 微秒」→ **已被本轮重测取代。** 本轮 `next mount-namespace clone p50` 这一列在挂载表不大时是 778.4 到 905.7 微秒,在 1000 份 overlayfs 挂载之后是 1859.0 微秒。旧数里 47.8 微秒与 184.7 微秒这两档本轮没有复现出来。
+    - 「挂载操作在压力下等 1.27 秒、空载 5.9 毫秒」→ **本轮没有测这一项。** 「挂载操作在压力下等 1.27 秒、空载 5.9 毫秒」测的是挂载操作在全局锁上的排队,本轮实验里没有对应的测量,所以这个数字仍然是未重跑的旧数,不能当成已核实的数字使用。
 - 复用的现成资产:本仓库既有的改内核 KVM 启动流程、结果目录约定与统计分析脚本;既有策略程序与目标注册接口。
 
 ## Comparison
@@ -59,6 +72,8 @@
 - **btrfs 子卷是否开启配额组必须写明并冻结**,因为官方文档承认开启配额组时快照规模化会有不可接受的延迟;两种设置下的数字不可混用。
 - 视图内容清单:目录树的文件数、目录数、总字节数,以及每份视图与基线树的差异条数。
 - **2026-08-05 补充:条件 2(每视图一次 overlayfs 挂载)必须显式开启 `metacopy` 与 `redirect_dir` 两个挂载选项,并把完整的挂载选项串记录进结果元数据。** 理由是不开这两个选项等于拿一个被人为削弱的 overlayfs 作对照,得出的数字没有说服力:YoloFS 论文里那条"把基线目录树镜像到上层太贵"的成本论证,正是因为没考虑这两个选项而不成立。内核官方文档原句(我们亲手核实过):`metacopy` 使得 `When the "metacopy" feature is enabled, overlayfs will only copy up metadata (as opposed to whole file), when a metadata specific operation like chown/chmod is performed.`,而且 `The data will be copied up later when file is opened for WRITE operation.`;`redirect_dir` 使得改目录名时 `the directory will be copied up (but not the contents). Then the "trusted.overlay.redirect" extended attribute is set to the path of the original location from the root of the overlay.` 两个选项的开关状态在整个矩阵内必须一致,不同设置下的数字不可混用。
+
+- **2026-08-22 补充:条件 4(namei_ext)的目标注册走哪条路径必须冻结,并写进结果元数据。** 目标注册指的是把「某个任务在某条路径上应该看到哪棵树」这条对应关系交给内核的那一步。现在仓库里有两条实现路径:旧的一条是每注册一个目标就 fork 一个控制 helper(一个专门用来下达这条注册命令的辅助进程),新的一条由远端提交 `1f529c3 experiment: batch configmap target setup` 与 `f899d58 test: validate batched target registration` 引入,改成一个 helper 加重复的控制写入。**两条路径的每视图供给成本不是一个量级**:一条要为每个目标付一次进程创建,另一条不付。不冻结这一项,测出来的每视图供给成本无法与别人的数比较,也无法与本仓库自己此前的数比较。
 
 ## Workloads And Metrics
 
@@ -105,6 +120,18 @@
 - **2026-08-05 补充:只要 `## Comparison` 里那个第五条件没有实现,就不能回答"给 overlayfs 加一个重排层栈的 ioctl 是否就够了"。** 这是审稿人会问的问题,DeltaBox 已经把这条路实现出来并发表了。这种情况下我们的答复只能建立在按任务与按挂载的粒度差别上,而不是能力有无:改层栈按挂载生效,同一挂载点上的所有使用者一起换;我们的判定按任务生效,同一挂载点上不同任务可以同时看到不同的东西。这句限制要一并写进论文。
 
 可以得出的结论只有一条:在这台机器、这个视图数量范围内,每份视图的供给成本随视图数量的增长关系,本机制与主对照相比是什么样。
+
+**2026-08-22 补充:宿主基线这一半真正证明了什么。**
+
+结果根目录 `results/experiments/view-supply-cost-host/20260808T155425Z-formal01/` 里 namei_ext 一侧没有任何数字,所以下面三条全部是基线条件之间的比较,一条都不涉及 namei_ext 与主对照的配对比值。活下来的发现有三条:第一条,块级克隆那条路线为每份视图多占一份页缓存;第二条,挂载表变大会让复制挂载命名空间变贵,这个现象只在 overlayfs 那一支上量到;第三条,正在被使用的视图换不了指向。
+
+**第一条,块级克隆那条路线为每份视图多占一份页缓存。** 64 份视图各读 1024 MiB 同样内容时,`btrfs_snapshot` 相对 `bind_same_source` 的页缓存倍数中位数是 67.65,95% 置信区间 [65.35, 68.04];`overlay_same_lower` 相对 `bind_same_source` 只有 1.0686,95% 置信区间 [1.0345, 1.0903]。绝对值:`bind_same_source` 三次试验分别新增 16744 / 16648 / 17256 KB 页缓存,`overlay_same_lower` 是 18152 / 17892 / 17852 KB,`btrfs_snapshot` 是 1127720 / 1132740 / 1132808 KB。第一条这个结果与 `## Published Precedent And Real Assets` 一节引的 LWN 那两句一致。
+
+**第二条,挂载表变大会让复制挂载命名空间变贵,这个现象只在 overlayfs 那一支上量到。** `next mount-namespace clone p50` 这一列在绝大多数格子里是 778.4 到 905.7 微秒,唯独 `overlayfs_mount` 在 1000 份视图时是 1859.0 微秒,大约是其余格子的 2.3 倍。这是挂载路线唯一量到的、随视图数量恶化的指标。
+
+**第三条,正在被使用的视图换不了指向。** 空闲时把一份视图换指向的 p50 是 1167779 / 1207511 / 1208032 纳秒(三次试验),95% 置信区间分别是 [1139821, 1192488]、[1189141.5, 1242226]、[1154899.5, 1237123];而在这份视图正被使用时,三次试验的 `umount` 全部返回 32,错误信息是 `umount: .../scratch/switch/view: target is busy.` 第三条量到的正是 `## Workloads And Metrics` 第 3 项要求分别报的两种情形——「必须先让使用者退出」和「不必让使用者退出」。
+
+第一条、第二条、第三条的适用范围到此为止,再往外就没有数据支撑:只限于跑这次实验的那台宿主机(不是改过内核的虚拟机),只限于实测走到的视图数量区间(建立、切换与内存那几项走到 1 到 1000 份,页缓存那一项是 64 份视图各读 1024 MiB),只限于这次用的那一份视图内容清单。换一台机器、换一份内容清单、或者把视图数量推到 10000 档,第一条、第二条、第三条都要重新测一遍。
 
 ## Reproducibility Notes
 
