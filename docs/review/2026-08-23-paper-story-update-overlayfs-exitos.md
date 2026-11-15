@@ -6,7 +6,7 @@
 
 当前仓库的七个 RQ1 工作流都可以证明已有对象的选择、隐藏、撤销或切换，但这不等于 OverlayFS 做不到。对于需要 COW、写隔离、rollback、commit、whiteout 或目录合并的工作负载，OverlayFS 的能力明显更完整；对于静态的单对象绑定，bind mount 也已经足够。
 
-宿主机 mount 基线还显示，在 1--1000 个 bind-mount view 范围内，扣除控制进程后每个 view 约占 11--13 KB slab，1000 个 view 时没有测出额外的供给延迟。因此论文删除“mount 很贵”“mount 不能提供 per-task view”“mount 不能在运行中改变答案”这三类动机；原始实验计划也明确要求在该结果下撤掉 per-view cost advantage。参见 [`docs/tmp/2026-08-05-rq2-view-supply-cost-experiment-plan.md`](../tmp/2026-08-05-rq2-view-supply-cost-experiment-plan.md) 和本分支的 OverlayFS 定位复核文档。
+宿主机 mount 基线还显示，扣除控制进程后每个 view 的 slab 开销在 1 个 view 时测不出（0.0 KB）、10 个 view 时 0.8 KB、100 个和 1000 个 view 时分别为 12.68 KB 和 11.36 KB；供给延迟差值为 +130 µs（1 个 view）、+67 µs（10）、+22 µs（100）和 −31 µs（1000），最后两档在噪声量级，因此只说 100--1000 个 view 区间没有测出额外供给延迟。阶梯只跑到 1000 个 view：计划要求的 10000 档需要 10000 个常驻 mount namespace 进程，本机内存放不下，`mk/experiments/mount_route_host_baseline.mk:23` 的 `VIEW_SUPPLY_COST_LADDER ?= 1,10,100,1000` 记录了这个上限，所以 10000 档的结论目前没有数据。因此论文删除“mount 很贵”“mount 不能提供 per-task view”“mount 不能在运行中改变答案”这三类动机；原始实验计划也明确要求在该结果下撤掉 per-view cost advantage。参见 [`docs/tmp/2026-08-05-rq2-view-supply-cost-experiment-plan.md`](../tmp/2026-08-05-rq2-view-supply-cost-experiment-plan.md) 和本分支的 OverlayFS 定位复核文档。
 
 `namei_ext` 仅剩一个条件化差异：在同一个共享 mount namespace 中，控制器可以按 cgroup 在 lookup/readdir 时选择预注册的原生对象，并通过策略更新改变后续 lookup 的结果，而不重新建立 mount 拓扑。这个差异不是 OverlayFS 的能力缺失，也不是已证明的成本优势；如果任务可以接受独立 mount namespace、视图变化不频繁，并且需要 COW/写隔离，OverlayFS 或 bind mount 应当是默认方案。
 

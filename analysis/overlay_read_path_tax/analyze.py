@@ -12,7 +12,7 @@ import os
 import random
 import statistics
 
-BOOTSTRAP_RESAMPLES = 10000
+BOOTSTRAP_RESAMPLES = 2000
 METRICS = ("stat_ns", "open_ns", "readdir_ns", "cold_read_ns")
 
 
@@ -32,7 +32,7 @@ def percentile(sorted_values, fraction):
 BOOTSTRAP_DRAW = 4000
 
 
-def ratio_ci(numerator, denominator, rng, resamples=2000):
+def ratio_ci(numerator, denominator, rng, resamples=BOOTSTRAP_RESAMPLES):
     draw_numerator = min(len(numerator), BOOTSTRAP_DRAW)
     draw_denominator = min(len(denominator), BOOTSTRAP_DRAW)
     estimates = []
@@ -83,7 +83,7 @@ def main():
         raise SystemExit("no native condition; nothing to compare against")
 
     summary = {"schema": "namei_ext.overlay_read_path_tax.summary.v1",
-               "bootstrap_resamples": 2000,
+               "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
                "bootstrap_draw_per_replicate": BOOTSTRAP_DRAW,
                "seed": args.seed,
                "conditions": [], "identity": identity}
@@ -114,6 +114,15 @@ def main():
              "filesystem directly. `overlay_dN` reads it through an overlayfs "
              "mount with a writable upper directory and N read-only lower "
              "directories, `metacopy` and `redirect_dir` enabled.", "",
+             "`cold open+read` drops caches before every sample, so each "
+             "sample pays the device. Its ratio dips below 1 at depth 1 "
+             "(0.785, and each of the three trials reproduces it) and only "
+             "crosses 1 at depth 2: the experiment does not isolate why, and "
+             "native is always the first condition measured in a trial, so "
+             "read the shallow end as the shape of the curve, not as evidence "
+             "that an overlay read is faster. The cost of the stack itself is "
+             "what `stat` and `open` show, flat near 1.2 and 1.35 at every "
+             "depth, and `readdir` grows from 1.106 to 3.361.", "",
              "| condition | depth | stat p50 (ns) | vs native | open p50 (ns) "
              "| vs native | readdir p50 (us) | vs native | cold open+read p50 "
              "(us) | vs native |",

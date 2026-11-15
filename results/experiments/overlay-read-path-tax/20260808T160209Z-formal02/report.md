@@ -2,6 +2,8 @@
 
 Same content, same host kernel. `native` reads the lower filesystem directly. `overlay_dN` reads it through an overlayfs mount with a writable upper directory and N read-only lower directories, `metacopy` and `redirect_dir` enabled.
 
+`cold open+read` drops caches before every sample, so each sample pays the device. Its ratio dips below 1 at depth 1 (0.785, and each of the three trials reproduces it) and only crosses 1 at depth 2: the experiment does not isolate why, and native is always the first condition measured in a trial, so read the shallow end as the shape of the curve, not as evidence that an overlay read is faster. The cost of the stack itself is what `stat` and `open` show, flat near 1.2 and 1.35 at every depth, and `readdir` grows from 1.106 to 3.361.
+
 | condition | depth | stat p50 (ns) | vs native | open p50 (ns) | vs native | readdir p50 (us) | vs native | cold open+read p50 (us) | vs native |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | native | 0 | 2903 | -- | 3555 | -- | 36.9 | -- | 2700.5 | -- |
